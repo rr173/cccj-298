@@ -17,6 +17,9 @@
 共同承担一家供应商的一张发票，财务一次性付清整张发票；付款经过一个独立、
 可本地运行、可重放的模拟银行通道，不接真实银行。详见第 8 节。
 
+在此基础上还实现了**分期结账**：财务为活动发起结账、在固定截点取得对账草稿，
+核对后签认或放弃另取截点；签认账单是下一期的期初依据，且永不改写。详见第 9 节。
+
 ## 1. 运行
 
 ```bash
@@ -69,7 +72,9 @@ pytest
 幂等重试/改参拒绝，以及 16–20 线程下的同号兑现、并发兑现、并发退款和捐赠人
 额度竞争。联合报销另覆盖份额登记与改参冲突、分别同意/撤回、排队跳过、在途占用、
 缺口、失败重排队、响应丢失/重启恢复、重复与矛盾回执，以及并发送付/退款/确认结果
-不会只扣一部分项目。
+不会只扣一部分项目。分期结账另覆盖首期/续期口径、截点隔离、银行优先、跨期指令
+只计一次、草稿/签认/放弃生命周期、不可签认原因定位、并发起草与并发签认、重启后
+不重复成期，以及签认账单在后续业务变化中保持原样。
 
 ## 4. 主要接口
 
@@ -98,6 +103,11 @@ pytest
 | `POST` | `/campaigns/{cid}/payments/{num}/results` | 送达银行终态结果（成功/失败） |
 | `POST` | `/campaigns/{cid}/payments/{num}/sync` | 重启后按指令号查回/补交并同步结果 |
 | `GET` | `/campaigns/{cid}/reimbursement-funds` | **各项目已付、在途、暂占、可用与缺口** |
+| `POST` | `/campaigns/{cid}/closings` | **发起结账草稿**（固定截点、期号、对账结果） |
+| `GET` | `/campaigns/{cid}/closings` | 全部结账（草稿/已签认/已放弃）及最近签认 |
+| `GET` | `/campaigns/{cid}/closings/{clid}` | 单份结账账单（含分项依据） |
+| `POST` | `/campaigns/{cid}/closings/{clid}/sign` | **签认该份确切草稿**（内容不重算） |
+| `POST` | `/campaigns/{cid}/closings/{clid}/discard` | 放弃草稿，可另取截点 |
 | `POST` | `/simulated-bank/payments` | 模拟通道受理（独立库，按指令号去重） |
 | `GET` | `/simulated-bank/payments/{num}` | 查询模拟通道受理/结果 |
 | `POST` | `/simulated-bank/payments/{num}/results` | 模拟通道确认成功/失败 |
@@ -206,10 +216,12 @@ app/db.py              SQLite schema、连接、BEGIN IMMEDIATE 写事务
 app/service.py         暂配算法、退款冲正、兑现、幂等和不变量
 app/reimbursement.py   联合报销：份额、同意、排队、送付、银行结果、项目额度/缺口
 app/bank.py            独立持久化的模拟付款通道（按指令号去重、终态不可覆盖）
+app/closing.py         分期结账：固定截点对账草稿、签认/放弃、银行优先与跨期归期
 app/models.py          请求模型与金额校验
 app/main.py            FastAPI 路由和错误响应
 scripts/demo_ledger.py         原有配捐小账
 scripts/demo_reimbursement.py  联合报销可复跑示例
+scripts/demo_closing.py        分期结账可复跑示例
 tests/                 领域、HTTP、并发、模拟通道测试
 ```
 
@@ -335,3 +347,102 @@ python scripts/demo_reimbursement.py
 `BEGIN IMMEDIATE` 事务里串行化；付款指令的状态变更一次作用于整张发票的所有份额，
 因此并发退款、同意变更、送付或确认结果时，不会留下"只扣一部分项目"的账。
 模拟通道另有独立事务和自己的约束，保证结果重复送达、旧回执、矛盾终态都不会破坏已确认结果。
+
+## 9. 分期结账
+
+财务为活动发起结账，系统在**固定截点**给出对账草稿；核对后可签认这份草稿，
+或放弃它另取截点。签认账单可供今后查阅，也是下一期的期初依据。草稿等候签认期间，
+活动照常运行（捐款、退款、兑现、送付、银行回执都不受影响）。
+
+### 9.1 账单口径
+
+结账逐项目列出：
+
+```text
+opening_book_balance   上一份已签认账单的期末账面余额（首期为 0）
++ period_grants        上次签认截点之后到本次截点的新增实际拨款
+- period_reversals     同期的新增实际冲正
+- bank_confirmed_reimbursement
+                       本期内由银行确认成功、属于该项目份额的报销支出
+= closing_book_balance 期末账面余额
+```
+
+首期期初为零；此后**只计上次签认截点之后到本次截点的新发生额**，绝不把历史累计额
+再算一遍。另列截点尚未明确成功或失败的送付占用，并区分：
+
+- `bank_not_accepted`：业务账已送付，但银行还没有受理记录（正常在途，不算失败）；
+- `bank_accepted_pending`：银行已受理，但截点前没有明确成功/失败；
+
+并据此给出 `available_after_in_flight_cents`（扣占用后可用）或
+`gap_after_in_flight_cents`（扣占用后的缺口）。**暂配（provisional）和未送付发票的
+暂占（reserved）都不进结账单。**
+
+每个金额都附可查的分项依据：`basis.grants` / `basis.reversals` /
+`basis.bank_confirmed_reimbursements` / `basis.outstanding_in_flight`。跨期在途指令在
+下期计入支出时会带 `prior_in_flight`，指回它在上期哪份已签账单被记为占用；
+每个报销分项同时给出原指令号、发票号、收款方与项目份额，以及对应的原捐款单 /
+退款单 / 兑现事件编号。
+
+### 9.2 银行优先与跨期归期
+
+结账单以**同一截点的业务账与独立模拟银行记录**对账，并以银行结果为准：
+
+- 银行在截点前已确认成功或失败，即使业务账还没同步，也按银行结果处理；
+- 一笔跨期指令**只在银行首次确认成功的那一期**计支出；后来补同步不再计，已签过的
+  期间也不会因此重算；
+- 银行明确失败只结束占用，不产生支出；
+- 同一张发票的不同付款尝试按指令号分开，各自独立归期；
+- 业务账已标终态却无对应银行终态、两边终态冲突、或银行记录取不到时，草稿仍然生成，
+  但 `signable=false` 并给出 `blockers`，定位到具体指令与原因；这类草稿不能签认；
+- 银行可查但尚无该待定指令，视为正常在途，不当作失败；
+- 结账是只读的：不补送指令、不同步回执、不改变配捐或报销状态。
+
+### 9.3 草稿、签认与放弃
+
+```bash
+# 发起结账，取固定截点（不传 cutoff_at 则取当前时刻）
+curl -sS -X POST http://127.0.0.1:8000/api/v1/campaigns/oss-2026/closings \
+  -H 'Content-Type: application/json' \
+  -d '{"source_event_id":"close-2026-01"}'
+
+# 核对后签认这份确切草稿
+curl -sS -X POST \
+  http://127.0.0.1:8000/api/v1/campaigns/oss-2026/closings/1/sign \
+  -H 'Content-Type: application/json' -d '{"source_event_id":"sign-2026-01"}'
+
+# 或者放弃它，另取截点
+curl -sS -X POST \
+  http://127.0.0.1:8000/api/v1/campaigns/oss-2026/closings/1/discard \
+  -H 'Content-Type: application/json' -d '{"source_event_id":"discard-2026-01"}'
+```
+
+- 同一活动只能有一份 `draft`（数据库部分唯一索引兜底），重复发起返回
+  `409 closing_draft_exists` 并指回原草稿；
+- 发起请求有重试编号：同号同参重试仍指向**原草稿**，不产生新截点，响应带
+  `Idempotency-Replayed: true`；同号改参返回 `409 idempotency_parameter_mismatch`；
+- 签认针对草稿创建时冻结的确切内容，**不重算余额**：草稿等候期间业务变化不会改变
+  将签的账单；草稿内容还有 `content_hash`，签认前会校验未被篡改；
+- 放弃后旧草稿不可签认；之后可另取截点（新期号仍从上一份已签账单继续）；
+- 新截点必须严格晚于上一份已签账单的截点，避免两期覆盖同一期间；
+- 签认重试（同号）返回原签认，不会另立一期；并发签认只会有一次成功，其余返回
+  `409 closing_already_signed`；数据库唯一索引保证同一期最多一份签认账单。
+
+### 9.4 可复跑示例
+
+```bash
+python scripts/demo_closing.py
+```
+
+每次重建 `demo_closing.db` 与独立的 `demo_closing.db.bank.db`。完整稳定输出保存在
+[`demo_closing_output.txt`](./demo_closing_output.txt)，依次演示：一笔联合付款在首期
+截点仍为在途占用；首期签认后业务继续运行；银行随后确认成功（此时业务账尚未同步）；
+第二期把同一指令按银行首次确认计为支出、期初余额指回首份已签账单；第三期不再重复
+计入；且**首期已签账单一字不变**。
+
+### 9.5 并发保证
+
+起草、签认、放弃都在记账库的 `BEGIN IMMEDIATE` 事务里串行化，因此账单对应一个完整
+截点：与拨款、冲正、送付或银行出结果并发时，不会只带入同一笔业务的一部分。
+签认前还会重新读一次独立银行库直到两次快照一致，避免银行结果恰好落在读快照的
+窗口里。重启后或并发签认时，数据库唯一索引与幂等记录保证不会出现两份账单覆盖同一
+期间，也不会发布半份账单。

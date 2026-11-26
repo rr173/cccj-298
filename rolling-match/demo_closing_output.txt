@@ -1,0 +1,33 @@
+1. Joint invoice INV-1001 is submitted as one instruction PAY-1-1 for 500¢; it is now in flight.
+
+2. Period 1 draft at a fixed cutoff (period_no=1, signable=True).
+
+== 3. Period 1 balances with the joint payment outstanding ==
+project   opening  +grants  -reversal  -bank-paid  =closing  hold  available  gap
+docs            0     500         0          0      500  300       200   0
+kernel          0     400         0          0      400  200       200   0
+   hold PAY-1-1 500¢ state=bank_accepted_pending bank_status=pending shares=[{'project_id': 'docs', 'share_cents': 300}, {'project_id': 'kernel', 'share_cents': 200}]
+
+4. Finance signs period 1. Its frozen totals are {"available_after_in_flight_cents": 400, "bank_confirmed_payment_count": 0, "bank_confirmed_reimbursement_cents": 0, "bank_explicit_failure_count": 0, "closing_book_balance_cents": 900, "gap_after_in_flight_cents": 0, "opening_book_balance_cents": 0, "outstanding_in_flight_cents": 500, "outstanding_in_flight_instruction_count": 1, "period_grants_cents": 900, "period_reversals_cents": 0}.
+
+5. After signing, docs gets a 50¢ reversal and kernel gets a new 100¢ actual grant. These belong to period 2 only.
+
+6. The bank confirms success for the joint payment; the business ledger is still unsynced. The bank result is authoritative.
+
+7. Period 2 draft, opening basis = the signed period-1 statement #1 (period_no=1).
+
+== 8. Period 2 balances (joint payment expensed once here) ==
+project   opening  +grants  -reversal  -bank-paid  =closing  hold  available  gap
+docs          500       0        50        300      150    0       150   0
+kernel        400     100         0        200      300    0       300   0
+   expensed PAY-1-1 500¢ expensed_by_bank_first=True ledger_status_at_cutoff=pending
+     carried from closing #1 (period 1)
+
+9. The ledger later syncs the same instruction; because the bank already confirmed it in period 2, a later sync adds no second expense.
+
+10. Period 3 draft opens from the period-2 signed balances (docs=150¢, kernel=300¢) and lists no expense again.
+
+11. The first signed statement is unchanged: its totals still equal the frozen snapshot and the joint payment is still recorded there as an outstanding hold, exactly as reviewed.
+
+PASS: periodic closing demo completed. Inspect /workspace/rolling-match/demo_closing.db and /workspace/rolling-match/demo_closing.db.bank.db with sqlite3 if desired.
+

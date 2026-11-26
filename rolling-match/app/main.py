@@ -14,6 +14,9 @@ from .models import (
     BankResultSimulation,
     BankSubmitSimulation,
     CampaignCreate,
+    ClosingCreate,
+    ClosingDiscard,
+    ClosingSign,
     DonationCreate,
     InvoiceConsentCreate,
     InvoiceRegister,
@@ -25,6 +28,7 @@ from .models import (
     SettlementCreate,
 )
 from .bank import BankError, resolve_bank_db_path, SimulatedBank
+from .closing import ClosingService
 from .reimbursement import ReimbursementService
 from .service import LedgerError, LedgerService
 
@@ -44,12 +48,13 @@ def create_app(
 
     app = FastAPI(
         title="Open Source Foundation Rolling Match API",
-        version="1.1.0",
+        version="1.2.0",
         description=(
             "Integer-cent donation matching with provisional allocation, "
             "project-level realization, immutable grant history, idempotent "
-            "events, order-level refund corrections, and joint vendor-invoice "
-            "reimbursement through a standalone simulated payment channel."
+            "events, order-level refund corrections, joint vendor-invoice "
+            "reimbursement through a standalone simulated payment channel, "
+            "and periodic sign-off closings reconciled against that bank."
         ),
     )
     app.state.db_path = path
@@ -62,6 +67,9 @@ def create_app(
         return ReimbursementService(
             app.state.db_path, app.state.bank_db_path
         )
+
+    def closing() -> ClosingService:
+        return ClosingService(app.state.db_path, app.state.bank_db_path)
 
     @app.exception_handler(LedgerError)
     async def ledger_error_handler(
@@ -362,6 +370,66 @@ def create_app(
     )
     def get_reimbursement_funds(campaign_id: str) -> dict[str, Any]:
         return reimbursement().project_funds(campaign_id)
+
+    # ------------------------------------------------------------------
+    # Periodic sign-off statements (closings)
+    # ------------------------------------------------------------------
+    @app.post(
+        "/api/v1/campaigns/{campaign_id}/closings",
+        tags=["closings"],
+        status_code=201,
+    )
+    def create_closing(
+        campaign_id: str, payload: ClosingCreate
+    ) -> JSONResponse:
+        result = closing().create_draft(
+            campaign_id,
+            source_event_id=payload.source_event_id,
+            cutoff_at=payload.cutoff_at,
+        )
+        return _command_response(result)
+
+    @app.get(
+        "/api/v1/campaigns/{campaign_id}/closings",
+        tags=["closings"],
+    )
+    def list_closings(campaign_id: str) -> dict[str, Any]:
+        return closing().list_closings(campaign_id)
+
+    @app.get(
+        "/api/v1/campaigns/{campaign_id}/closings/{closing_id}",
+        tags=["closings"],
+    )
+    def get_closing(campaign_id: str, closing_id: int) -> dict[str, Any]:
+        return closing().get_closing(campaign_id, closing_id)
+
+    @app.post(
+        "/api/v1/campaigns/{campaign_id}/closings/{closing_id}/sign",
+        tags=["closings"],
+    )
+    def sign_closing(
+        campaign_id: str, closing_id: int, payload: ClosingSign
+    ) -> JSONResponse:
+        result = closing().sign_closing(
+            campaign_id,
+            closing_id,
+            source_event_id=payload.source_event_id,
+        )
+        return _command_response(result)
+
+    @app.post(
+        "/api/v1/campaigns/{campaign_id}/closings/{closing_id}/discard",
+        tags=["closings"],
+    )
+    def discard_closing(
+        campaign_id: str, closing_id: int, payload: ClosingDiscard
+    ) -> JSONResponse:
+        result = closing().discard_closing(
+            campaign_id,
+            closing_id,
+            source_event_id=payload.source_event_id,
+        )
+        return _command_response(result)
 
     # ------------------------------------------------------------------
     # Simulated bank channel (local only; no real bank is contacted)

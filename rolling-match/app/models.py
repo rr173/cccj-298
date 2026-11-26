@@ -89,3 +89,16 @@ class BankResultSimulation(BaseModel):
 
 class BankLoseResponseSimulation(BaseModel):
     enabled: bool = True
+
+
+class ClosingCreate(BaseModel):
+    source_event_id: NonEmptyId
+    cutoff_at: str | None = Field(default=None, max_length=40)
+
+
+class ClosingSign(BaseModel):
+    source_event_id: NonEmptyId
+
+
+class ClosingDiscard(BaseModel):
+    source_event_id: NonEmptyId

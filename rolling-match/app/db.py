@@ -238,6 +238,50 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_one_pending
 CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_one_succeeded
     ON payment_instructions(invoice_id)
     WHERE status = 'succeeded';
+
+-- ------------------------------------------------------------------
+-- Periodic sign-off statements ("closings").
+--
+-- A closing is a frozen reconciliation statement at a fixed cutoff.
+-- Drafts can be signed or discarded; signed statements are immutable and
+-- become the opening basis of the next period.  Only one draft may exist
+-- per campaign, and only one signed statement may cover a period.
+-- ------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS closings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    campaign_id TEXT NOT NULL REFERENCES campaigns(id),
+    period_no INTEGER NOT NULL CHECK (period_no > 0),
+    status TEXT NOT NULL DEFAULT 'draft'
+        CHECK (status IN ('draft', 'signed', 'discarded')),
+    source_event_id TEXT NOT NULL,
+    cutoff_at TEXT NOT NULL,
+    content_json TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    signable INTEGER NOT NULL CHECK (signable IN (0, 1)),
+    blockers_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL
+        DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    signed_at TEXT,
+    discarded_at TEXT,
+    UNIQUE (campaign_id, source_event_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_closings_campaign_period
+    ON closings(campaign_id, period_no, id);
+
+-- At most one un-signed draft per campaign.  This is the structural part of
+-- "one campaign has exactly one pending draft"; the service also checks it
+-- inside BEGIN IMMEDIATE for a friendly error.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_closing_one_draft
+    ON closings(campaign_id)
+    WHERE status = 'draft';
+
+-- A period can be signed exactly once, so no two statements ever cover the
+-- same interval, even across restarts or concurrent sign calls.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_closing_one_signed_period
+    ON closings(campaign_id, period_no)
+    WHERE status = 'signed';
 """
 
 
