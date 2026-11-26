@@ -1,0 +1,62 @@
+
+== 1. Donations accepted: pool gives don-2 only 400¢ ==
+pool: limit=1000¢ net_granted=   0¢ actual_remaining=1000¢ provisional=1000¢ unallocated=   0¢
+order don   donor  project      orig refnd remain grant net uncov prov wait
+    1 don-1 alice  docs          600    0    600     0   0   600  600    0
+    2 don-2 bob    kernel        600    0    600     0   0   600  400  200
+project totals:
+  docs         actual_net=   0¢ provisional= 600¢ waitlisted=   0¢
+  kernel       actual_net=   0¢ provisional= 400¢ waitlisted= 200¢
+
+2. Kernel prepared and settled only itself: settlement #1 granted 400¢ against don-2.
+
+== 3. After actual kernel grant: docs still first; kernel waits ==
+pool: limit=1000¢ net_granted= 400¢ actual_remaining= 600¢ provisional= 600¢ unallocated=   0¢
+order don   donor  project      orig refnd remain grant net uncov prov wait
+    1 don-1 alice  docs          600    0    600     0   0   600  600    0
+    2 don-2 bob    kernel        600    0    600   400 400   200    0  200
+project totals:
+  docs         actual_net=   0¢ provisional= 600¢ waitlisted=   0¢
+  kernel       actual_net= 400¢ provisional=   0¢ waitlisted= 200¢
+
+4. Refund ref-1 = 100¢ against don-1 causes NO actual reversal.
+
+== 5. Refund shrinks earlier order, so waiting kernel gets 100¢ provisional ==
+pool: limit=1000¢ net_granted= 400¢ actual_remaining= 600¢ provisional= 600¢ unallocated=   0¢
+order don   donor  project      orig refnd remain grant net uncov prov wait
+    1 don-1 alice  docs          600  100    500     0   0   500  500    0
+    2 don-2 bob    kernel        600    0    600   400 400   200  100  100
+project totals:
+  docs         actual_net=   0¢ provisional= 500¢ waitlisted=   0¢
+  kernel       actual_net= 400¢ provisional= 100¢ waitlisted= 100¢
+
+6. Second refund ref-2 = 500¢ fully refunds don-1; kernel provisional rises to 200¢.
+7. Another 1¢ refund is rejected: 0¢ refundable.
+8. Same ref-1 parameters retry returns the ORIGINAL response (replayed=true, cumulative_refunded=100¢ at that event), not today's 600¢ total. HTTP also sets Idempotency-Replayed: true.
+9. Same ref-1 number with changed amount is rejected with 409.
+
+10. Kernel's second actual grant set-kernel-2 = 200¢. First grant history is not rewritten.
+11. New translation donation don-3=500¢ gets 400¢ provisional because 600¢ of pool is actually granted.
+
+12. Refund don-2 by 250¢ leaves 350¢ real money against 600¢ net old grants, so actual reversal rev-#1 = 250¢.
+
+== 13. Reversal releases pool: translation provisional rises 400→500 ==
+pool: limit=1000¢ net_granted= 350¢ actual_remaining= 650¢ provisional= 500¢ unallocated= 150¢
+order don   donor  project      orig refnd remain grant net uncov prov wait
+    1 don-1 alice  docs          600  600      0     0   0     0    0    0
+    2 don-2 bob    kernel        600  250    350   600 350     0    0    0
+    3 don-3 carol  translation   500    0    500     0   0   500  500    0
+project totals:
+  docs         actual_net=   0¢ provisional=   0¢ waitlisted=   0¢
+  kernel       actual_net= 350¢ provisional=   0¢ waitlisted=   0¢
+  translation  actual_net=   0¢ provisional= 500¢ waitlisted=   0¢
+
+== Kernel immutable actual grant batches ==
+  set-kernel-1 settlement_id=1 total=400¢ [don-2=400¢]
+  set-kernel-2 settlement_id=2 total=200¢ [don-2=200¢]
+
+== don-2 original-order reversals ==
+  reversal_id=1 refund=ref-3 amount=250¢
+
+PASS: demo completed. Inspect /workspace/rolling-match/demo_ledger.db with sqlite3 if desired.
+
