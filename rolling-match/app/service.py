@@ -16,6 +16,10 @@ from typing import Any
 
 from .db import read_conn, write_transaction
 
+# Keep in sync with app.merger.ACTIVE; imported lazily inside methods to avoid
+# a module-level import cycle (app.merger imports this module).
+PROJECT_STATUS_ACTIVE = "active"
+
 
 class LedgerError(Exception):
     """A deterministic business-rule or idempotency error."""
@@ -539,13 +543,26 @@ class LedgerService:
             row = self._get_project(conn, campaign_id, project_id)
             body = dict(row)
             body["is_ready"] = bool(body["is_ready"])
+            body["is_active"] = body["status"] == PROJECT_STATUS_ACTIVE
             return CommandResult(201, body, False)
 
     def set_project_ready(
         self, campaign_id: str, project_id: str, is_ready: bool
     ) -> dict[str, Any]:
         with write_transaction(self.db_path) as conn:
-            self._get_project(conn, campaign_id, project_id)
+            project = self._get_project(conn, campaign_id, project_id)
+            if project["status"] != PROJECT_STATUS_ACTIVE:
+                raise LedgerError(
+                    "project_merged_cannot_change_ready",
+                    "A merged-out project can no longer change its readiness.",
+                    status_code=409,
+                    details={
+                        "project_id": project_id,
+                        "merged_into_project_id": project[
+                            "merged_into_project_id"
+                        ],
+                    },
+                )
             conn.execute(
                 "UPDATE projects SET is_ready = ? "
                 "WHERE campaign_id = ? AND id = ?",
@@ -554,6 +571,7 @@ class LedgerService:
             row = self._get_project(conn, campaign_id, project_id)
             body = dict(row)
             body["is_ready"] = bool(body["is_ready"])
+            body["is_active"] = body["status"] == PROJECT_STATUS_ACTIVE
             return body
 
     # ------------------------------------------------------------------
@@ -586,7 +604,21 @@ class LedgerService:
                 return replay
 
             self._get_campaign(conn, campaign_id)
-            self._get_project(conn, campaign_id, project_id)
+            project = self._get_project(conn, campaign_id, project_id)
+            if project["status"] != PROJECT_STATUS_ACTIVE:
+                raise LedgerError(
+                    "project_merged_no_new_donations",
+                    "A project that has been merged out can no longer receive "
+                    "new donations.",
+                    status_code=409,
+                    details={
+                        "project_id": project_id,
+                        "status": project["status"],
+                        "merged_into_project_id": project[
+                            "merged_into_project_id"
+                        ],
+                    },
+                )
 
             cursor = conn.execute(
                 """
@@ -734,17 +766,27 @@ class LedgerService:
 
             reversal_body: dict[str, Any] | None = None
             if reversal_amount > 0:
+                from .merger import MergerService
+
+                # The refund follows the original donation order and the
+                # matching rules are unchanged, but the money consequence is
+                # borne by the project responsible now (a successor after a
+                # merger).
+                responsible_project_id = MergerService.current_responsible(
+                    conn, campaign_id, donation["project_id"]
+                )
                 rev_cursor = conn.execute(
                     """
                     INSERT INTO reversals (
                         campaign_id, donation_id, refund_id,
-                        amount_cents, reason
-                    ) VALUES (?, ?, ?, ?, ?)
+                        responsible_project_id, amount_cents, reason
+                    ) VALUES (?, ?, ?, ?, ?, ?)
                     """,
                     (
                         campaign_id,
                         donation_pk,
                         refund_pk,
+                        responsible_project_id,
                         reversal_amount,
                         (
                             "Automatic order-level correction because "
@@ -813,6 +855,20 @@ class LedgerService:
 
             self._get_campaign(conn, campaign_id)
             project = self._get_project(conn, campaign_id, project_id)
+            if project["status"] != PROJECT_STATUS_ACTIVE:
+                raise LedgerError(
+                    "project_merged_cannot_settle",
+                    "A project that has been merged out can no longer be "
+                    "settled; its waiting donations are settled through the "
+                    "current responsible project.",
+                    status_code=409,
+                    details={
+                        "project_id": project_id,
+                        "merged_into_project_id": project[
+                            "merged_into_project_id"
+                        ],
+                    },
+                )
             if not project["is_ready"]:
                 raise LedgerError(
                     "project_not_ready",
@@ -820,12 +876,21 @@ class LedgerService:
                     status_code=409,
                 )
 
+            from .merger import MergerService
+
             view = self._provisional_view(conn, campaign_id)
+            # A successor settles every provisional item whose original
+            # donation project is now its responsibility.  The grant keeps the
+            # original donation's project id for traceability while recording
+            # the successor as the responsible project.
             selected = [
                 item
                 for item in view["items"]
-                if item["project_id"] == project_id
-                and item["provisional_match_cents"] > 0
+                if item["provisional_match_cents"] > 0
+                and MergerService.current_responsible(
+                    conn, campaign_id, item["project_id"]
+                )
+                == project_id
             ]
             total = sum(i["provisional_match_cents"] for i in selected)
 
@@ -854,12 +919,13 @@ class LedgerService:
                     """
                     INSERT INTO grant_items (
                         settlement_id, campaign_id, project_id,
-                        donation_id, amount_cents
-                    ) VALUES (?, ?, ?, ?, ?)
+                        responsible_project_id, donation_id, amount_cents
+                    ) VALUES (?, ?, ?, ?, ?, ?)
                     """,
                     (
                         settlement_pk,
                         campaign_id,
+                        item["project_id"],
                         project_id,
                         item["donation_pk"],
                         amount,
@@ -872,6 +938,8 @@ class LedgerService:
                         "settlement_id": settlement_pk,
                         "donation_id": item["donation_pk"],
                         "donation_source_event_id": item["source_event_id"],
+                        "original_project_id": item["project_id"],
+                        "responsible_project_id": project_id,
                         "accepted_order": item["accepted_order"],
                         "amount_cents": amount,
                     }
@@ -925,6 +993,7 @@ class LedgerService:
             result = [dict(r) for r in rows]
             for r in result:
                 r["is_ready"] = bool(r["is_ready"])
+                r["is_active"] = r["status"] == PROJECT_STATUS_ACTIVE
             return result
 
     def provisional(self, campaign_id: str) -> dict[str, Any]:
@@ -972,6 +1041,8 @@ class LedgerService:
                         gi.id,
                         gi.settlement_id,
                         gi.donation_id,
+                        gi.project_id AS original_project_id,
+                        gi.responsible_project_id,
                         gi.amount_cents,
                         gi.created_at,
                         d.source_event_id AS donation_source_event_id,
@@ -993,6 +1064,10 @@ class LedgerService:
             return {
                 "campaign_id": campaign_id,
                 "project_id": project_id,
+                "scope_note": (
+                    "Settlements whose responsible project is this project; "
+                    "grant items keep each donation's original project id."
+                ),
                 "grant_batch_count": len(result_settlements),
                 "gross_granted_cents": total_granted,
                 "settlements": result_settlements,
@@ -1025,11 +1100,12 @@ class LedgerService:
                     rv.campaign_id,
                     rv.donation_id,
                     rv.refund_id,
+                    rv.responsible_project_id,
                     rv.amount_cents,
                     rv.reason,
                     rv.created_at,
                     d.source_event_id AS donation_source_event_id,
-                    d.project_id,
+                    d.project_id AS original_project_id,
                     d.donor_id,
                     rf.source_event_id AS refund_source_event_id
                 FROM reversals rv

@@ -6,9 +6,9 @@
 project   opening  +grants  -reversal  -bank-paid  =closing  hold  available  gap
 docs            0     500         0          0      500  300       200   0
 kernel          0     400         0          0      400  200       200   0
-   hold PAY-1-1 500¢ state=bank_accepted_pending bank_status=pending shares=[{'project_id': 'docs', 'share_cents': 300}, {'project_id': 'kernel', 'share_cents': 200}]
+   hold PAY-1-1 500¢ state=bank_accepted_pending bank_status=pending shares=[{'project_id': 'docs', 'responsible_project_id': 'docs', 'share_cents': 300}, {'project_id': 'kernel', 'responsible_project_id': 'kernel', 'share_cents': 200}]
 
-4. Finance signs period 1. Its frozen totals are {"available_after_in_flight_cents": 400, "bank_confirmed_payment_count": 0, "bank_confirmed_reimbursement_cents": 0, "bank_explicit_failure_count": 0, "closing_book_balance_cents": 900, "gap_after_in_flight_cents": 0, "opening_book_balance_cents": 0, "outstanding_in_flight_cents": 500, "outstanding_in_flight_instruction_count": 1, "period_grants_cents": 900, "period_reversals_cents": 0}.
+4. Finance signs period 1. Its frozen totals are {"available_after_in_flight_cents": 400, "bank_confirmed_payment_count": 0, "bank_confirmed_reimbursement_cents": 0, "bank_explicit_failure_count": 0, "closing_book_balance_cents": 900, "gap_after_in_flight_cents": 0, "opening_book_balance_cents": 0, "outstanding_in_flight_cents": 500, "outstanding_in_flight_instruction_count": 1, "period_grants_cents": 900, "period_reversals_cents": 0, "period_transfer_in_cents": 0, "period_transfer_out_cents": 0}.
 
 5. After signing, docs gets a 50¢ reversal and kernel gets a new 100¢ actual grant. These belong to period 2 only.
 

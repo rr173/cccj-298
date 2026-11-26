@@ -106,7 +106,7 @@ class ReimbursementService:
         return list(
             conn.execute(
                 """
-                SELECT project_id, share_cents
+                SELECT project_id, responsible_project_id, share_cents
                 FROM invoice_shares
                 WHERE invoice_id = ?
                 ORDER BY project_id ASC
@@ -129,46 +129,77 @@ class ReimbursementService:
         ).fetchall()
         return [dict(r) for r in rows]
 
-    @classmethod
     def _project_funds(
-        cls, conn: sqlite3.Connection, campaign_id: str
+        self, conn: sqlite3.Connection, campaign_id: str
     ) -> dict[str, dict[str, Any]]:
-        """Realized net grants minus paid, in-flight, and temporary holds."""
+        """Realized money minus paid, in-flight, and temporary holds.
+
+        Every component is attributed to the project *currently responsible*.
+        Realized money therefore includes internal transfers received through
+        a merger, while a merged-out project keeps no spendable balance.
+        In-flight and paid invoice shares are aggregated from all original
+        shareholders whose responsibility now points at the same project, so
+        two shares of one invoice borne by the same project are judged
+        together against one balance, never each against its own copy.
+        """
         rows = conn.execute(
             """
             SELECT
                 p.id AS project_id,
+                p.status AS status,
                 COALESCE(g.gross_granted_cents, 0) AS gross_granted_cents,
-                COALESCE(rv.reversed_cents, 0) AS reversed_cents
+                COALESCE(rv.reversed_cents, 0) AS reversed_cents,
+                COALESCE(tin.transfer_in_cents, 0) AS transfer_in_cents,
+                COALESCE(tout.transfer_out_cents, 0) AS transfer_out_cents
             FROM projects p
             LEFT JOIN (
-                SELECT project_id, SUM(amount_cents) AS gross_granted_cents
+                SELECT responsible_project_id AS project_id,
+                       SUM(amount_cents) AS gross_granted_cents
                 FROM grant_items
                 WHERE campaign_id = ?
-                GROUP BY project_id
+                GROUP BY responsible_project_id
             ) g ON g.project_id = p.id
             LEFT JOIN (
-                SELECT d.project_id, SUM(rv.amount_cents) AS reversed_cents
-                FROM reversals rv
-                JOIN donations d ON d.id = rv.donation_id
-                WHERE rv.campaign_id = ?
-                GROUP BY d.project_id
+                SELECT responsible_project_id AS project_id,
+                       SUM(amount_cents) AS reversed_cents
+                FROM reversals
+                WHERE campaign_id = ?
+                GROUP BY responsible_project_id
             ) rv ON rv.project_id = p.id
+            LEFT JOIN (
+                SELECT project_id, SUM(amount_cents) AS transfer_in_cents
+                FROM internal_transfer_entries
+                WHERE campaign_id = ? AND direction = 'in'
+                GROUP BY project_id
+            ) tin ON tin.project_id = p.id
+            LEFT JOIN (
+                SELECT project_id, SUM(amount_cents) AS transfer_out_cents
+                FROM internal_transfer_entries
+                WHERE campaign_id = ? AND direction = 'out'
+                GROUP BY project_id
+            ) tout ON tout.project_id = p.id
             WHERE p.campaign_id = ?
             ORDER BY p.id ASC
             """,
-            (campaign_id, campaign_id, campaign_id),
+            (campaign_id, campaign_id, campaign_id, campaign_id, campaign_id),
         ).fetchall()
 
         funds: dict[str, dict[str, Any]] = {}
         for row in rows:
             gross = int(row["gross_granted_cents"])
             reversed_cents = int(row["reversed_cents"])
+            transfer_in = int(row["transfer_in_cents"])
+            transfer_out = int(row["transfer_out_cents"])
+            realized = gross - reversed_cents + transfer_in - transfer_out
             funds[row["project_id"]] = {
                 "project_id": row["project_id"],
+                "status": row["status"],
+                "is_active": row["status"] == "active",
                 "gross_granted_cents": gross,
                 "reversed_cents": reversed_cents,
-                "realized_net_grant_cents": gross - reversed_cents,
+                "internal_transfer_in_cents": transfer_in,
+                "internal_transfer_out_cents": transfer_out,
+                "realized_net_grant_cents": realized,
                 "paid_cents": 0,
                 "in_flight_cents": 0,
                 "reserved_cents": 0,
@@ -176,44 +207,113 @@ class ReimbursementService:
                 "gap_cents": 0,
             }
 
+        # Invoice shares are summed by the project currently responsible, so
+        # several original shareholders merged into one project are judged with
+        # a single combined balance.
         for status, key in (
             ("succeeded", "paid_cents"),
             ("pending", "in_flight_cents"),
         ):
             for row in conn.execute(
                 """
-                SELECT s.project_id, SUM(s.share_cents) AS amount_cents
+                SELECT s.responsible_project_id AS project_id,
+                       SUM(s.share_cents) AS amount_cents
                 FROM invoice_shares s
                 JOIN payment_instructions pi
                   ON pi.invoice_id = s.invoice_id
                 WHERE s.campaign_id = ? AND pi.status = ?
-                GROUP BY s.project_id
+                GROUP BY s.responsible_project_id
                 """,
                 (campaign_id, status),
             ).fetchall():
                 if row["project_id"] in funds:
                     funds[row["project_id"]][key] += int(row["amount_cents"])
 
+        # Bank-confirmed successful spend attributed by the project
+        # responsible at the bank's confirmation moment.  This mirrors the
+        # merger/closing bank-first rule: a merged project keeps the spend
+        # confirmed before it was merged out, while a success confirmed
+        # afterwards is borne by the successor.
+        bank_rows: dict[str, dict[str, Any]] | None
+        try:
+            with read_conn(self.bank_db_path) as bank_conn:
+                bank_rows = {
+                    row["instruction_number"]: dict(row)
+                    for row in bank_conn.execute(
+                        "SELECT * FROM bank_payments"
+                    ).fetchall()
+                }
+        except (sqlite3.Error, OSError):
+            bank_rows = None
+        if bank_rows is not None:
+            instructions = conn.execute(
+                """
+                SELECT pi.instruction_number
+                FROM payment_instructions pi
+                WHERE pi.campaign_id = ?
+                """,
+                (campaign_id,),
+            ).fetchall()
+            book_spend = {project_id: 0 for project_id in funds}
+            from .merger import MergerService
+
+            for instruction in instructions:
+                number = instruction["instruction_number"]
+                bank_row = bank_rows.get(number)
+                if bank_row is None or bank_row["status"] != "succeeded":
+                    continue
+                result_at = bank_row.get("result_at")
+                for share in conn.execute(
+                    """
+                    SELECT s.project_id, s.share_cents
+                    FROM invoice_shares s
+                    JOIN payment_instructions pi
+                      ON pi.invoice_id = s.invoice_id
+                    WHERE pi.instruction_number = ?
+                    """,
+                    (number,),
+                ).fetchall():
+                    responsible = MergerService.responsible_at(
+                        conn,
+                        campaign_id,
+                        share["project_id"],
+                        result_at,
+                    )
+                    if responsible in book_spend:
+                        book_spend[responsible] += int(share["share_cents"])
+            for project_id, spend in book_spend.items():
+                funds[project_id]["book_balance_spend_cents"] = spend
+
         for fund in funds.values():
-            # Paid and in-flight amounts are deducted first; when they exceed
-            # realized money the shortfall is reported as a gap.  A gap is
-            # never spendable and later grants fill it before providing new
-            # headroom.
+            book_spend = fund.get("book_balance_spend_cents", fund["paid_cents"])
+            # The book balance is realized money (including merger transfers)
+            # net of every bank-confirmed expense attributed to the project at
+            # the bank confirmation time.  For a merged-out project it is
+            # always zero: the remaining book left through the internal
+            # transfer, while its historical grant/reversal/spend lines stay
+            # queryable separately.
+            fund["book_balance_cents"] = (
+                fund["realized_net_grant_cents"] - book_spend
+            )
+            # Spendable headroom deducts every confirmed expense (including a
+            # merged project's pre-merger spend already moved through the
+            # transfer) and current in-flight holds.  When they exceed
+            # realized money the shortfall is reported as a gap; a gap is
+            # never spendable and later grants fill it before new headroom.
             net_headroom = (
                 fund["realized_net_grant_cents"]
-                - fund["paid_cents"]
+                - book_spend
                 - fund["in_flight_cents"]
             )
             fund["available_cents"] = max(0, net_headroom)
             fund["gap_cents"] = max(0, -net_headroom)
         return funds
 
-    @classmethod
     def _snapshot(
-        cls, conn: sqlite3.Connection, campaign_id: str
+        self, conn: sqlite3.Connection, campaign_id: str
     ) -> dict[str, Any]:
         """Current invoice payability and per-project reimbursement capacity."""
-        funds = cls._project_funds(conn, campaign_id)
+        funds = self._project_funds(conn, campaign_id)
 
         invoices: list[dict[str, Any]] = []
         invoice_rows = conn.execute(
@@ -223,7 +323,7 @@ class ReimbursementService:
 
         for registration_order, invoice in enumerate(invoice_rows, start=1):
             invoice_id = int(invoice["id"])
-            share_rows = cls._shares(conn, invoice_id)
+            share_rows = self._shares(conn, invoice_id)
             consent_rows = conn.execute(
                 """
                 SELECT project_id, consented
@@ -238,12 +338,13 @@ class ReimbursementService:
             shares = [
                 {
                     "project_id": row["project_id"],
+                    "responsible_project_id": row["responsible_project_id"],
                     "share_cents": int(row["share_cents"]),
                     "consented": consents.get(row["project_id"], False),
                 }
                 for row in share_rows
             ]
-            instructions = cls._instructions(conn, invoice_id)
+            instructions = self._instructions(conn, invoice_id)
             pending = next(
                 (i for i in instructions if i["status"] == "pending"), None
             )
@@ -288,7 +389,7 @@ class ReimbursementService:
                     "is_queued": False,
                     "not_payable_reason": reason,
                     "missing_consent_projects": [
-                        share["project_id"]
+                        share["responsible_project_id"]
                         for share in shares
                         if not share["consented"]
                     ],
@@ -304,16 +405,16 @@ class ReimbursementService:
             )
 
         # Temporary reservations are recomputed in invoice registration order.
-        # A whole invoice is reserved only if every project can bear its own
-        # share at that point; an invoice that does not fit is skipped without
-        # blocking later invoices.
+        # A whole invoice is reserved only if every currently responsible
+        # project can bear the *combined* total of its shares at that point
+        # (several original shareholders may now be the same project after a
+        # merger); an invoice that does not fit is skipped without blocking
+        # later invoices.
+        # Queue headroom uses the same book-spend basis as the funds view so
+        # pre-merger historical spend and transferred balances are judged with
+        # exactly the money a project can actually spend.
         queue_available = {
-            project_id: max(
-                0,
-                fund["realized_net_grant_cents"]
-                - fund["paid_cents"]
-                - fund["in_flight_cents"],
-            )
+            project_id: fund["available_cents"] + fund["reserved_cents"]
             for project_id, fund in funds.items()
         }
         reserved: dict[str, int] = {project_id: 0 for project_id in funds}
@@ -324,12 +425,20 @@ class ReimbursementService:
             if not invoice["fully_consented"]:
                 continue
 
-            shortfalls: dict[str, int] = {}
+            # Combine shares by the project currently responsible, so the same
+            # balance is never counted once per original shareholder.
+            combined: dict[str, int] = {}
             for share in invoice["shares"]:
-                project_id = share["project_id"]
-                available = queue_available.get(project_id, 0)
-                if share["share_cents"] > available:
-                    shortfalls[project_id] = share["share_cents"] - available
+                responsible = share["responsible_project_id"]
+                combined[responsible] = (
+                    combined.get(responsible, 0) + share["share_cents"]
+                )
+
+            shortfalls: dict[str, int] = {}
+            for responsible, total_share in combined.items():
+                available = queue_available.get(responsible, 0)
+                if total_share > available:
+                    shortfalls[responsible] = total_share - available
 
             if shortfalls:
                 invoice["not_payable_reason"] = "insufficient_project_funds"
@@ -337,15 +446,14 @@ class ReimbursementService:
                 continue
 
             reserved_by_project: dict[str, int] = {}
-            for share in invoice["shares"]:
-                project_id = share["project_id"]
-                queue_available[project_id] = (
-                    queue_available.get(project_id, 0) - share["share_cents"]
+            for responsible, total_share in combined.items():
+                queue_available[responsible] = (
+                    queue_available.get(responsible, 0) - total_share
                 )
-                reserved[project_id] = (
-                    reserved.get(project_id, 0) + share["share_cents"]
+                reserved[responsible] = (
+                    reserved.get(responsible, 0) + total_share
                 )
-                reserved_by_project[project_id] = share["share_cents"]
+                reserved_by_project[responsible] = total_share
             invoice["payable"] = True
             invoice["is_queued"] = True
             invoice["not_payable_reason"] = None
@@ -353,16 +461,19 @@ class ReimbursementService:
 
         for project_id, fund in funds.items():
             fund["reserved_cents"] = reserved.get(project_id, 0)
+            book_spend = fund.get(
+                "book_balance_spend_cents", fund["paid_cents"]
+            )
             fund["available_cents"] = max(
                 0,
                 fund["realized_net_grant_cents"]
-                - fund["paid_cents"]
+                - book_spend
                 - fund["in_flight_cents"]
                 - fund["reserved_cents"],
             )
             fund["gap_cents"] = max(
                 0,
-                fund["paid_cents"]
+                book_spend
                 + fund["in_flight_cents"]
                 - fund["realized_net_grant_cents"],
             )
@@ -386,12 +497,11 @@ class ReimbursementService:
             (i for i in snapshot["invoices"] if i["id"] == invoice_id), None
         )
 
-    @classmethod
     def _invoice_view(
-        cls, conn: sqlite3.Connection, campaign_id: str, invoice_id: int
+        self, conn: sqlite3.Connection, campaign_id: str, invoice_id: int
     ) -> dict[str, Any]:
-        snapshot = cls._snapshot(conn, campaign_id)
-        view = cls._invoice_from_snapshot(snapshot, invoice_id)
+        snapshot = self._snapshot(conn, campaign_id)
+        view = self._invoice_from_snapshot(snapshot, invoice_id)
         if view is None:
             raise LedgerError(
                 "invoice_not_found",
@@ -417,6 +527,7 @@ class ReimbursementService:
         body["allocations"] = [
             {
                 "project_id": row["project_id"],
+                "responsible_project_id": row["responsible_project_id"],
                 "share_cents": int(row["share_cents"]),
             }
             for row in share_rows
@@ -440,11 +551,10 @@ class ReimbursementService:
     # ------------------------------------------------------------------
     # Invariants
     # ------------------------------------------------------------------
-    @classmethod
     def _assert_reimbursement_invariants(
-        cls, conn: sqlite3.Connection, campaign_id: str
+        self, conn: sqlite3.Connection, campaign_id: str
     ) -> None:
-        snapshot = cls._snapshot(conn, campaign_id)
+        snapshot = self._snapshot(conn, campaign_id)
         for invoice in snapshot["invoices"]:
             share_total = sum(
                 share["share_cents"] for share in invoice["shares"]
@@ -499,10 +609,13 @@ class ReimbursementService:
                     )
 
         for fund in snapshot["projects"]:
+            book_spend = fund.get(
+                "book_balance_spend_cents", fund["paid_cents"]
+            )
             capacity = max(
                 0,
                 fund["realized_net_grant_cents"]
-                - fund["paid_cents"]
+                - book_spend
                 - fund["in_flight_cents"],
             )
             if fund["reserved_cents"] > capacity:
@@ -513,6 +626,33 @@ class ReimbursementService:
                     status_code=500,
                     details={"project_id": fund["project_id"]},
                 )
+
+        # Every invoice share must point at the project currently responsible
+        # for its original shareholder.
+        from .merger import MergerService
+
+        for invoice in snapshot["invoices"]:
+            for share in invoice["shares"]:
+                expected = MergerService.current_responsible(
+                    conn,
+                    campaign_id,
+                    share["project_id"],
+                )
+                if share["responsible_project_id"] != expected:
+                    raise LedgerError(
+                        "invariant_share_responsibility",
+                        "An invoice share is not pointed at its current "
+                        "responsible project.",
+                        status_code=500,
+                        details={
+                            "invoice_id": invoice["id"],
+                            "original_project_id": share["project_id"],
+                            "stored_responsible_project_id": share[
+                                "responsible_project_id"
+                            ],
+                            "expected_responsible_project_id": expected,
+                        },
+                    )
 
     # ------------------------------------------------------------------
     # Invoice registration
@@ -586,9 +726,23 @@ class ReimbursementService:
 
             LedgerService._get_campaign(conn, campaign_id)
             for share in normalized_shares:
-                LedgerService._get_project(
+                project = LedgerService._get_project(
                     conn, campaign_id, share["project_id"]
                 )
+                if project["status"] != "active":
+                    raise LedgerError(
+                        "project_merged_no_new_invoice_share",
+                        "A merged-out project can no longer take a share of a "
+                        "new invoice; register the share under its current "
+                        "responsible project instead.",
+                        status_code=409,
+                        details={
+                            "project_id": share["project_id"],
+                            "merged_into_project_id": project[
+                                "merged_into_project_id"
+                            ],
+                        },
+                    )
 
             existing = conn.execute(
                 """
@@ -649,12 +803,14 @@ class ReimbursementService:
                 conn.execute(
                     """
                     INSERT INTO invoice_shares (
-                        invoice_id, campaign_id, project_id, share_cents
-                    ) VALUES (?, ?, ?, ?)
+                        invoice_id, campaign_id, project_id,
+                        responsible_project_id, share_cents
+                    ) VALUES (?, ?, ?, ?, ?)
                     """,
                     (
                         invoice_id,
                         campaign_id,
+                        share["project_id"],
                         share["project_id"],
                         share["share_cents"],
                     ),
@@ -722,12 +878,47 @@ class ReimbursementService:
                 (invoice_id, project_id),
             ).fetchone()
             if share is None:
+                # A successor re-confirms transferred shares under its own
+                # project id; consent rows stay keyed by the immutable original
+                # shareholder, so resolve them here.
+                share = conn.execute(
+                    """
+                    SELECT * FROM invoice_shares
+                    WHERE invoice_id = ? AND responsible_project_id = ?
+                    """,
+                    (invoice_id, project_id),
+                ).fetchall()
+            else:
+                share = [share]
+            if not share:
                 raise LedgerError(
                     "invoice_project_not_shareholder",
                     f"Project {project_id!r} does not carry a share of "
                     f"invoice {invoice_id}.",
                     status_code=404,
                 )
+            share_rows = list(share)
+            original_project_ids = {row["project_id"] for row in share_rows}
+            responsible_ids = {
+                row["responsible_project_id"] for row in share_rows
+            }
+            # Only the project currently responsible may (re-)confirm.  A
+            # merged original shareholder can no longer act on its old share.
+            if project_id not in responsible_ids:
+                raise LedgerError(
+                    "invoice_consent_project_not_responsible",
+                    "The original shareholder has been merged out; the current "
+                    "responsible project must confirm this share.",
+                    status_code=409,
+                    details={
+                        "original_project_ids": sorted(original_project_ids),
+                        "responsible_project_ids": sorted(responsible_ids),
+                    },
+                )
+            # A direct original-shareholder call must also be the current
+            # responsible project (handled above); here every row the caller
+            # bears is updated together, so one successor confirmation covers
+            # all transferred shares on this invoice.
 
             locked = conn.execute(
                 """
@@ -751,26 +942,27 @@ class ReimbursementService:
                     },
                 )
 
-            conn.execute(
-                """
-                INSERT INTO invoice_consents (
-                    invoice_id, campaign_id, project_id, consented,
-                    last_source_event_id, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(invoice_id, project_id) DO UPDATE SET
-                    consented = excluded.consented,
-                    last_source_event_id = excluded.last_source_event_id,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    invoice_id,
-                    campaign_id,
-                    project_id,
-                    1 if consented else 0,
-                    source_event_id,
-                    _now(),
-                ),
-            )
+            for row in share_rows:
+                conn.execute(
+                    """
+                    INSERT INTO invoice_consents (
+                        invoice_id, campaign_id, project_id, consented,
+                        last_source_event_id, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(invoice_id, project_id) DO UPDATE SET
+                        consented = excluded.consented,
+                        last_source_event_id = excluded.last_source_event_id,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        invoice_id,
+                        campaign_id,
+                        row["project_id"],
+                        1 if consented else 0,
+                        source_event_id,
+                        _now(),
+                    ),
+                )
 
             self._assert_reimbursement_invariants(conn, campaign_id)
             body = self._invoice_view(conn, campaign_id, invoice_id)

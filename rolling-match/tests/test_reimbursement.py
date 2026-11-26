@@ -330,8 +330,16 @@ def test_successful_payment_keeps_shares_and_blocks_second_payment(
     )
     assert result.body["status"] == "succeeded"
     assert result.body["allocations"] == [
-        {"project_id": "a", "share_cents": 600},
-        {"project_id": "b", "share_cents": 400},
+        {
+            "project_id": "a",
+            "responsible_project_id": "a",
+            "share_cents": 600,
+        },
+        {
+            "project_id": "b",
+            "responsible_project_id": "b",
+            "share_cents": 400,
+        },
     ]
 
     funds = {

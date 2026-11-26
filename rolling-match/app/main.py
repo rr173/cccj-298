@@ -23,12 +23,14 @@ from .models import (
     PaymentResult,
     PaymentSubmit,
     ProjectCreate,
+    ProjectMergerCreate,
     ProjectReadyUpdate,
     RefundCreate,
     SettlementCreate,
 )
 from .bank import BankError, resolve_bank_db_path, SimulatedBank
 from .closing import ClosingService
+from .merger import MergerService
 from .reimbursement import ReimbursementService
 from .service import LedgerError, LedgerService
 
@@ -48,13 +50,15 @@ def create_app(
 
     app = FastAPI(
         title="Open Source Foundation Rolling Match API",
-        version="1.2.0",
+        version="1.3.0",
         description=(
             "Integer-cent donation matching with provisional allocation, "
             "project-level realization, immutable grant history, idempotent "
             "events, order-level refund corrections, joint vendor-invoice "
             "reimbursement through a standalone simulated payment channel, "
-            "and periodic sign-off closings reconciled against that bank."
+            "periodic sign-off closings reconciled against that bank, and "
+            "irreversible project handovers (mergers) that transfer remaining "
+            "money and all outstanding obligations between projects."
         ),
     )
     app.state.db_path = path
@@ -70,6 +74,9 @@ def create_app(
 
     def closing() -> ClosingService:
         return ClosingService(app.state.db_path, app.state.bank_db_path)
+
+    def merger() -> MergerService:
+        return MergerService(app.state.db_path, app.state.bank_db_path)
 
     @app.exception_handler(LedgerError)
     async def ledger_error_handler(
@@ -430,6 +437,46 @@ def create_app(
             source_event_id=payload.source_event_id,
         )
         return _command_response(result)
+
+    # ------------------------------------------------------------------
+    # Project handovers (mergers)
+    # ------------------------------------------------------------------
+    @app.post(
+        "/api/v1/campaigns/{campaign_id}/mergers",
+        tags=["mergers"],
+        status_code=201,
+    )
+    def create_merger(
+        campaign_id: str, payload: ProjectMergerCreate
+    ) -> JSONResponse:
+        result = merger().merge_projects(
+            campaign_id,
+            source_event_id=payload.source_event_id,
+            source_project_id=payload.source_project_id,
+            successor_project_id=payload.successor_project_id,
+        )
+        return _command_response(result)
+
+    @app.get(
+        "/api/v1/campaigns/{campaign_id}/mergers",
+        tags=["mergers"],
+    )
+    def list_mergers(campaign_id: str) -> dict[str, Any]:
+        return merger().list_mergers(campaign_id)
+
+    @app.get(
+        "/api/v1/campaigns/{campaign_id}/mergers/{merger_id}",
+        tags=["mergers"],
+    )
+    def get_merger(campaign_id: str, merger_id: int) -> dict[str, Any]:
+        return merger().get_merger(campaign_id, merger_id)
+
+    @app.get(
+        "/api/v1/campaigns/{campaign_id}/project-responsibility",
+        tags=["mergers"],
+    )
+    def project_responsibility(campaign_id: str) -> dict[str, Any]:
+        return merger().project_responsibility(campaign_id)
 
     # ------------------------------------------------------------------
     # Simulated bank channel (local only; no real bank is contacted)

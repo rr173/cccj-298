@@ -1,0 +1,72 @@
+1. docs and kernel each realize 1000¢ of actual matching money (provisional match alone is never spendable).
+
+== Starting funds ==
+project  status  realized  book  paid  in-flight  reserved  available  gap
+docs     active      1000  1000     0          0         0       1000    0
+kernel   active      1000  1000     0          0         0       1000    0
+
+2. Joint invoice INV-HANDOVER (800¢: docs 600¢ + kernel 200¢) is submitted as PAY-1-1; it is still in flight at handover. A second 150¢ docs-only invoice is registered and consented but not yet submitted.
+
+== Funds with the in-flight hold ==
+project  status  realized  book  paid  in-flight  reserved  available  gap
+docs     active      1000  1000     0        600       150        250    0
+kernel   active      1000  1000     0        200         0        800    0
+
+3. Finance merges docs into kernel while the payment is pending. Merger #1 is effective immediately and irreversible.
+   internal transfer out docs    1000¢ (merger #1)
+   internal transfer in  kernel  1000¢ (merger #1)
+   transferred book balance: 1000¢ (actual spend deducted, in-flight hold NOT deducted)
+   transferred invoice shares: docs -> kernel 600¢ (invoice #1), docs -> kernel 150¢ (invoice #2)
+
+== Funds immediately after the merger ==
+project  status  realized  book  paid  in-flight  reserved  available  gap
+docs     merged         0     0     0          0         0          0    0
+kernel   active      2000  2000     0        800         0       1200    0
+
+4a. The docs-only queued invoice no longer queues: docs' old consent is void (payable=False, reason='consent_pending'); the share now reads docs -> kernel.
+    kernel re-confirms the transferred share and the invoice queues again (payable=True).
+
+4. Repeating the same merger source event returns the original record (idempotent); changing parameters is rejected.
+   changed-parameter retry -> 409 idempotency_parameter_mismatch
+   new donation to merged docs -> 409 project_merged_no_new_donations; new invoice shares are refused the same way.
+
+5. kernel registers a new 900¢ invoice. It is payable from the combined balance: its own 1000¢ plus the 1000¢ transferred from docs, with the 800¢ in-flight hold already reserved.
+   submitted as PAY-3-1 (a second, separate payment).
+
+== Funds while both payments are in flight ==
+project  status  realized  book  paid  in-flight  reserved  available  gap
+docs     merged         0     0     0          0         0          0    0
+kernel   active      2000  2000     0       1700       150        150    0
+
+6. The original instruction PAY-1-1 is never changed or re-sent. On bank success it settles against kernel, including the 600¢ share docs used to bear:
+   original docs    now responsible kernel  600¢
+   original kernel  now responsible kernel  200¢
+
+== Funds after both payments succeed ==
+project  status  realized  book  paid  in-flight  reserved  available  gap
+docs     merged         0     0     0          0         0          0    0
+kernel   active      2000   300  1700          0       150        150    0
+
+7. A 300¢ refund against the original docs donation still uses the original order; the matching rules are unchanged but the reversal is borne by the successor:
+   donation don-docs (original project docs) -> reversal 300¢ responsible project kernel
+
+== Funds after the post-merger reversal ==
+project  status  realized  book  paid  in-flight  reserved  available  gap
+docs     merged         0     0     0          0         0          0    0
+kernel   active      1700     0  1700          0         0          0    0
+
+8. Payment PAY-4-1 fails. The hold is released and the invoice requeues (state=unpaid, payable=True, reason=None). As with the transferred docs share in step 4a, only the project currently responsible can confirm a resend.
+   after kernel re-confirms, the resend is accepted as PAY-4-2 (attempt 2).
+
+9. Current responsibility:
+   docs    status=merged  responsible now: kernel
+   kernel  status=active  responsible now: kernel
+
+10. Periodic closing statement (the merger is an internal transfer in this period):
+project  opening  +grants  -reversal  +transfer-in  -transfer-out  -bank-paid  =closing
+docs           0    1000          0             0            1000           0         0
+kernel         0    1500        300          1000               0        1900       300
+   merger #1 docs -> kernel transferred 1000¢ (source event merge-docs-into-kernel)
+
+PASS: project handover demo completed. Inspect /workspace/rolling-match/demo_merger.db and /workspace/rolling-match/demo_merger.db.bank.db with sqlite3 if desired.
+

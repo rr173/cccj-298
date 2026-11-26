@@ -33,6 +33,7 @@ from typing import Any
 
 from .bank import SimulatedBank, resolve_bank_db_path
 from .db import read_conn, write_transaction
+from .merger import MergerService
 from .service import CommandResult, LedgerError, LedgerService, canonical_hash
 
 DRAFT = "draft"
@@ -627,6 +628,9 @@ class ClosingService:
         prior_instruction_max = int(
             (prior_snapshot or {}).get("max_payment_instruction_id", 0)
         )
+        prior_transfer_max = int(
+            (prior_snapshot or {}).get("max_internal_transfer_entry_id", 0)
+        )
 
         # Timestamps are compared in Python, not by SQL text ordering: the
         # ledger writes ISO-8601 with microseconds while SQLite defaults use
@@ -685,6 +689,24 @@ class ClosingService:
             int(instruction_period_rows[-1]["id"])
             if instruction_period_rows
             else prior_instruction_max
+        )
+
+        transfer_candidates = conn.execute(
+            """
+            SELECT id, effective_at AS created_at
+            FROM internal_transfer_entries
+            WHERE campaign_id = ? AND id > ?
+            ORDER BY id ASC
+            """,
+            (campaign_id, prior_transfer_max),
+        ).fetchall()
+        transfer_period_rows = _all_at_or_before(
+            transfer_candidates, "created_at", cutoff
+        )
+        transfer_max = (
+            int(transfer_period_rows[-1]["id"])
+            if transfer_period_rows
+            else prior_transfer_max
         )
 
         blockers: list[dict[str, Any]] = []
@@ -754,6 +776,8 @@ class ClosingService:
                 ),
                 "period_grants_cents": 0,
                 "period_reversals_cents": 0,
+                "period_transfer_in_cents": 0,
+                "period_transfer_out_cents": 0,
                 "bank_confirmed_reimbursement_cents": 0,
                 "closing_book_balance_cents": 0,
                 "outstanding_in_flight_cents": 0,
@@ -762,18 +786,23 @@ class ClosingService:
                 "basis": {
                     "grants": [],
                     "reversals": [],
+                    "internal_transfers": [],
                     "bank_confirmed_reimbursements": [],
                     "outstanding_in_flight": [],
                 },
             }
 
         # ---- Period actual grants (business ledger, id boundary) ----
+        # Attribution uses the project responsible when the grant happened;
+        # a successor's settlement carries the donation's original project id
+        # alongside its own responsible id.
         grant_rows = conn.execute(
             """
             SELECT
                 gi.id,
                 gi.settlement_id,
-                gi.project_id,
+                gi.project_id AS original_project_id,
+                gi.responsible_project_id AS project_id,
                 gi.donation_id,
                 gi.amount_cents,
                 gi.created_at,
@@ -806,6 +835,8 @@ class ClosingService:
                     "donation_source_event_id": row[
                         "donation_source_event_id"
                     ],
+                    "original_project_id": row["original_project_id"],
+                    "responsible_project_id": row["project_id"],
                     "donor_id": row["donor_id"],
                     "amount_cents": amount,
                     "created_at": row["created_at"],
@@ -817,10 +848,11 @@ class ClosingService:
             """
             SELECT
                 rv.id,
+                rv.responsible_project_id AS project_id,
                 rv.amount_cents,
                 rv.created_at,
                 rv.refund_id,
-                d.project_id,
+                d.project_id AS original_project_id,
                 d.source_event_id AS donation_source_event_id,
                 rf.source_event_id AS refund_source_event_id
             FROM reversals rv
@@ -849,8 +881,62 @@ class ClosingService:
                     "donation_source_event_id": row[
                         "donation_source_event_id"
                     ],
+                    "original_project_id": row["original_project_id"],
+                    "responsible_project_id": row["project_id"],
                     "amount_cents": amount,
                     "created_at": row["created_at"],
+                }
+            )
+
+        # ---- Period internal transfers (merger handovers) ----
+        # Each merger produces one 'out' and one 'in' line; only lines after
+        # the prior signed snapshot and at/before this cutoff enter this
+        # period.  The statement names the direction, the amount and the
+        # merger record so finance can trace every handover.
+        transfer_rows = conn.execute(
+            """
+            SELECT
+                ite.id, ite.merger_id, ite.project_id, ite.direction,
+                ite.amount_cents, ite.effective_at,
+                pm.source_project_id, pm.successor_project_id,
+                pm.source_event_id AS merger_source_event_id
+            FROM internal_transfer_entries ite
+            JOIN project_mergers pm ON pm.id = ite.merger_id
+            WHERE ite.campaign_id = ?
+              AND ite.id > ?
+              AND ite.id <= ?
+            ORDER BY ite.id ASC
+            """,
+            (campaign_id, prior_transfer_max, transfer_max),
+        ).fetchall()
+        merger_period_map: dict[int, dict[str, Any]] = {}
+        for row in transfer_rows:
+            merger_period_map[int(row["merger_id"])] = {
+                "merger_id": int(row["merger_id"]),
+                "source_event_id": row["merger_source_event_id"],
+                "source_project_id": row["source_project_id"],
+                "successor_project_id": row["successor_project_id"],
+                "transferred_book_balance_cents": int(row["amount_cents"]),
+            }
+        for row in transfer_rows:
+            project = projects.get(row["project_id"])
+            if project is None:
+                continue
+            amount = int(row["amount_cents"])
+            if row["direction"] == "in":
+                project["period_transfer_in_cents"] += amount
+            else:
+                project["period_transfer_out_cents"] += amount
+            project["basis"]["internal_transfers"].append(
+                {
+                    "internal_transfer_entry_id": int(row["id"]),
+                    "merger_id": int(row["merger_id"]),
+                    "merger_source_event_id": row["merger_source_event_id"],
+                    "source_project_id": row["source_project_id"],
+                    "successor_project_id": row["successor_project_id"],
+                    "direction": row["direction"],
+                    "amount_cents": amount,
+                    "effective_at": row["effective_at"],
                 }
             )
 
@@ -866,7 +952,7 @@ class ClosingService:
         invoice_shares: dict[int, list[dict[str, Any]]] = {}
         share_rows = conn.execute(
             """
-            SELECT invoice_id, project_id, share_cents
+            SELECT invoice_id, project_id, responsible_project_id, share_cents
             FROM invoice_shares
             WHERE campaign_id = ?
             ORDER BY invoice_id ASC, project_id ASC
@@ -877,6 +963,7 @@ class ClosingService:
             invoice_shares.setdefault(int(row["invoice_id"]), []).append(
                 {
                     "project_id": row["project_id"],
+                    "responsible_project_id": row["responsible_project_id"],
                     "share_cents": int(row["share_cents"]),
                 }
             )
@@ -1117,7 +1204,18 @@ class ClosingService:
                             )
                             bank_confirmed_in_period.append(payment)
                             for share in shares:
-                                project = projects.get(share["project_id"])
+                                # Expense attribution follows the project
+                                # responsible at the bank's confirmation
+                                # moment, so a payment confirmed after a merger
+                                # is settled against the successor even though
+                                # the share still names the original project.
+                                responsible = MergerService.responsible_at(
+                                    conn,
+                                    campaign_id,
+                                    share["project_id"],
+                                    result_at,
+                                )
+                                project = projects.get(responsible)
                                 if project is None:
                                     continue
                                 project[
@@ -1128,6 +1226,10 @@ class ClosingService:
                                 ].append(
                                     {
                                         **payment,
+                                        "original_project_id": share[
+                                            "project_id"
+                                        ],
+                                        "responsible_project_id": responsible,
                                         "share_cents": share["share_cents"],
                                     }
                                 )
@@ -1204,9 +1306,18 @@ class ClosingService:
             )
 
         # ---- Attach holds to per-project basis and compute balances ----
+        # Holds are attributed to the project responsible at the cutoff: an
+        # in-flight payment that crosses a merger keeps its instruction while
+        # the successor assumes the whole occupied hold.
         for hold in outstanding_in_flight:
             for share in hold["shares"]:
-                project = projects.get(share["project_id"])
+                responsible = MergerService.responsible_at(
+                    conn,
+                    campaign_id,
+                    share["project_id"],
+                    cutoff,
+                )
+                project = projects.get(responsible)
                 if project is None:
                     continue
                 project["outstanding_in_flight_cents"] += share[
@@ -1215,6 +1326,8 @@ class ClosingService:
                 project["basis"]["outstanding_in_flight"].append(
                     {
                         **hold,
+                        "original_project_id": share["project_id"],
+                        "responsible_project_id": responsible,
                         "project_share_cents": share["share_cents"],
                     }
                 )
@@ -1224,6 +1337,8 @@ class ClosingService:
                 project["opening_book_balance_cents"]
                 + project["period_grants_cents"]
                 - project["period_reversals_cents"]
+                + project["period_transfer_in_cents"]
+                - project["period_transfer_out_cents"]
                 - project["bank_confirmed_reimbursement_cents"]
             )
             project["available_after_in_flight_cents"] = max(
@@ -1251,6 +1366,12 @@ class ClosingService:
             ),
             "period_reversals_cents": sum(
                 p["period_reversals_cents"] for p in projects.values()
+            ),
+            "period_transfer_in_cents": sum(
+                p["period_transfer_in_cents"] for p in projects.values()
+            ),
+            "period_transfer_out_cents": sum(
+                p["period_transfer_out_cents"] for p in projects.values()
             ),
             "bank_confirmed_reimbursement_cents": sum(
                 p["bank_confirmed_reimbursement_cents"]
@@ -1294,6 +1415,7 @@ class ClosingService:
                     "max_grant_item_id": grant_max,
                     "max_reversal_id": reversal_max,
                     "max_payment_instruction_id": instruction_max,
+                    "max_internal_transfer_entry_id": transfer_max,
                 },
                 "prior_snapshot": prior_snapshot,
                 "excludes": (
@@ -1302,6 +1424,30 @@ class ClosingService:
                 ),
             },
             "projects": [projects[pid] for pid in sorted(projects)],
+            "mergers": {
+                "effective_in_period": [
+                    {
+                        "merger_id": merger_period_map[row["merger_id"]][
+                            "merger_id"
+                        ],
+                        "source_event_id": merger_period_map[
+                            row["merger_id"]
+                        ]["source_event_id"],
+                        "source_project_id": merger_period_map[
+                            row["merger_id"]
+                        ]["source_project_id"],
+                        "successor_project_id": merger_period_map[
+                            row["merger_id"]
+                        ]["successor_project_id"],
+                        "effective_at": row["effective_at"],
+                        "transferred_book_balance_cents": merger_period_map[
+                            row["merger_id"]
+                        ]["transferred_book_balance_cents"],
+                    }
+                    for row in transfer_rows
+                    if row["direction"] == "out"
+                ],
+            },
             "payments": {
                 "bank_confirmed_in_period": bank_confirmed_in_period,
                 "bank_explicit_failures": bank_explicit_failures,

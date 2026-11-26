@@ -29,6 +29,13 @@ CREATE TABLE IF NOT EXISTS projects (
     id TEXT NOT NULL,
     name TEXT NOT NULL,
     is_ready INTEGER NOT NULL DEFAULT 1 CHECK (is_ready IN (0, 1)),
+    -- 'active' projects may receive donations, invoice shares, settlements
+    -- and consent changes; a 'merged' project has been merged out exactly
+    -- once and may never receive new obligations.  The row is retained so all
+    -- historical records stay traceable under the original project id.
+    status TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'merged')),
+    merged_into_project_id TEXT,
     created_at TEXT NOT NULL
         DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     PRIMARY KEY (campaign_id, id)
@@ -97,6 +104,11 @@ CREATE TABLE IF NOT EXISTS grant_items (
     settlement_id INTEGER NOT NULL REFERENCES settlements(id),
     campaign_id TEXT NOT NULL REFERENCES campaigns(id),
     project_id TEXT NOT NULL,
+    -- The project responsible at grant time.  A settlement on a successor
+    -- grants against donations whose original project was merged into it, so
+    -- project_id (the donation's original project) and responsible_project_id
+    -- may differ.  Without any merger they are identical.
+    responsible_project_id TEXT NOT NULL,
     donation_id INTEGER NOT NULL REFERENCES donations(id),
     amount_cents INTEGER NOT NULL CHECK (amount_cents > 0),
     created_at TEXT NOT NULL
@@ -112,11 +124,15 @@ CREATE INDEX IF NOT EXISTS idx_grant_items_project
 
 -- Actual correction/reversal records.  Old grant_items are never updated or
 -- deleted; a reversal is a separate negative correction against an order.
+-- responsible_project_id is the project responsible when the refund happened
+-- (a refund against an old donation of a merged project is borne by the
+-- current successor).
 CREATE TABLE IF NOT EXISTS reversals (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     campaign_id TEXT NOT NULL REFERENCES campaigns(id),
     donation_id INTEGER NOT NULL REFERENCES donations(id),
     refund_id INTEGER NOT NULL REFERENCES refunds(id),
+    responsible_project_id TEXT NOT NULL,
     amount_cents INTEGER NOT NULL CHECK (amount_cents > 0),
     reason TEXT,
     created_at TEXT NOT NULL
@@ -172,7 +188,12 @@ CREATE INDEX IF NOT EXISTS idx_invoices_vendor_number
 CREATE TABLE IF NOT EXISTS invoice_shares (
     invoice_id INTEGER NOT NULL REFERENCES invoices(id),
     campaign_id TEXT NOT NULL REFERENCES campaigns(id),
+    -- project_id is the immutable original shareholder recorded at
+    -- registration; responsible_project_id is the project currently bearing
+    -- the share and is re-pointed along a merger chain when that shareholder
+    -- is merged out.  Both stay queryable, so history remains traceable.
     project_id TEXT NOT NULL,
+    responsible_project_id TEXT NOT NULL,
     share_cents INTEGER NOT NULL CHECK (share_cents > 0),
     created_at TEXT NOT NULL
         DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
@@ -183,9 +204,16 @@ CREATE TABLE IF NOT EXISTS invoice_shares (
 
 CREATE INDEX IF NOT EXISTS idx_invoice_shares_project
     ON invoice_shares(campaign_id, project_id);
+-- idx_invoice_shares_responsible is created in _run_migrations after the
+-- responsible_project_id column exists on every database version.
 
--- Each allocating project consents separately.  A missing row means "not yet
--- consented"; rows are only updated through an idempotent source event.
+-- Each original shareholder consents separately at registration, and consent
+-- is keyed by the original (immutable) project id.  A missing row means "not
+-- yet consented".  When responsibility moves through a merger, the prior
+-- consent of a transferred share is invalidated (consented reset to 0); the
+-- current responsible project must re-confirm before an unpaid invoice may
+-- queue again.  Rows are otherwise only updated through an idempotent source
+-- event.
 CREATE TABLE IF NOT EXISTS invoice_consents (
     invoice_id INTEGER NOT NULL REFERENCES invoices(id),
     campaign_id TEXT NOT NULL REFERENCES campaigns(id),
@@ -282,6 +310,61 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_closing_one_draft
 CREATE UNIQUE INDEX IF NOT EXISTS idx_closing_one_signed_period
     ON closings(campaign_id, period_no)
     WHERE status = 'signed';
+
+-- ------------------------------------------------------------------
+-- Project handovers ("mergers").
+--
+-- A merger moves every remaining obligation and the book balance of one
+-- active project (source) to another distinct, still-active project
+-- (successor) in the same campaign.  It is effective immediately and
+-- irreversible: a merged project can never be the source or target of
+-- another merger directly, but a successor may itself be merged out later
+-- (forming a responsibility chain).
+-- ------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS project_mergers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    campaign_id TEXT NOT NULL REFERENCES campaigns(id),
+    source_project_id TEXT NOT NULL,
+    successor_project_id TEXT NOT NULL,
+    source_event_id TEXT NOT NULL,
+    -- Book balance transferred at the effective moment: actual spend already
+    -- deducted, in-flight holds NOT deducted; may be negative.  The same
+    -- amount is booked out of the source and into the successor.
+    transferred_book_balance_cents INTEGER NOT NULL,
+    effective_at TEXT NOT NULL,
+    created_at TEXT NOT NULL
+        DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE (campaign_id, source_event_id),
+    -- A project can be merged out at most once.
+    UNIQUE (campaign_id, source_project_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_project_mergers_campaign
+    ON project_mergers(campaign_id, id);
+CREATE INDEX IF NOT EXISTS idx_project_mergers_successor
+    ON project_mergers(campaign_id, successor_project_id);
+
+-- Internal transfer entries are the ledger lines produced by a merger, one
+-- signed line per affected project in the period the merger takes effect.
+-- Negative amounts leave a project, positive amounts enter one.  Each pair
+-- references the same merger id so a statement can show the transfer-out,
+-- the transfer-in and the merger record they belong to.
+CREATE TABLE IF NOT EXISTS internal_transfer_entries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    campaign_id TEXT NOT NULL REFERENCES campaigns(id),
+    merger_id INTEGER NOT NULL REFERENCES project_mergers(id),
+    project_id TEXT NOT NULL,
+    direction TEXT NOT NULL CHECK (direction IN ('out', 'in')),
+    amount_cents INTEGER NOT NULL,
+    effective_at TEXT NOT NULL,
+    created_at TEXT NOT NULL
+        DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE (merger_id, project_id, direction)
+);
+
+CREATE INDEX IF NOT EXISTS idx_internal_transfer_project
+    ON internal_transfer_entries(campaign_id, project_id, id);
 """
 
 
@@ -309,6 +392,69 @@ def connect(db_path: str | Path | None = None) -> sqlite3.Connection:
     return conn
 
 
+def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _run_migrations(conn: sqlite3.Connection) -> None:
+    """Upgrade databases created by earlier versions in place.
+
+    New columns are added with a safe default and then backfilled from the
+    historical rows so responsibility is traceable after a merger while
+    pre-merger data keeps its original project as the responsible one.
+    """
+    project_cols = _column_names(conn, "projects")
+    if "status" not in project_cols:
+        conn.execute(
+            "ALTER TABLE projects ADD COLUMN status TEXT NOT NULL "
+            "DEFAULT 'active' CHECK (status IN ('active', 'merged'))"
+        )
+    if "merged_into_project_id" not in project_cols:
+        conn.execute(
+            "ALTER TABLE projects ADD COLUMN merged_into_project_id TEXT"
+        )
+
+    grant_cols = _column_names(conn, "grant_items")
+    if "responsible_project_id" not in grant_cols:
+        conn.execute(
+            "ALTER TABLE grant_items ADD COLUMN responsible_project_id TEXT"
+        )
+        conn.execute(
+            "UPDATE grant_items SET responsible_project_id = project_id "
+            "WHERE responsible_project_id IS NULL"
+        )
+
+    reversal_cols = _column_names(conn, "reversals")
+    if "responsible_project_id" not in reversal_cols:
+        conn.execute(
+            "ALTER TABLE reversals ADD COLUMN responsible_project_id TEXT"
+        )
+        conn.execute(
+            """
+            UPDATE reversals
+            SET responsible_project_id = (
+                SELECT d.project_id FROM donations d
+                WHERE d.id = reversals.donation_id
+            )
+            WHERE responsible_project_id IS NULL
+            """
+        )
+
+    share_cols = _column_names(conn, "invoice_shares")
+    if "responsible_project_id" not in share_cols:
+        conn.execute(
+            "ALTER TABLE invoice_shares ADD COLUMN responsible_project_id TEXT"
+        )
+        conn.execute(
+            "UPDATE invoice_shares SET responsible_project_id = project_id "
+            "WHERE responsible_project_id IS NULL"
+        )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_invoice_shares_responsible "
+        "ON invoice_shares(campaign_id, responsible_project_id)"
+    )
+
+
 def init_db(db_path: str | Path | None = None) -> None:
     path = resolve_db_path(db_path)
     if path != ":memory:":
@@ -316,6 +462,7 @@ def init_db(db_path: str | Path | None = None) -> None:
     conn = connect(path)
     try:
         conn.executescript(SCHEMA)
+        _run_migrations(conn)
     finally:
         conn.close()
 

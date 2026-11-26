@@ -139,8 +139,16 @@ def test_full_http_reimbursement_flow(db_path):
         assert found.json()["status"] == "pending"
         assert found.json()["bank"]["status"] == "pending"
         assert found.json()["allocations"] == [
-            {"project_id": "a", "share_cents": 600},
-            {"project_id": "b", "share_cents": 400},
+            {
+                "project_id": "a",
+                "responsible_project_id": "a",
+                "share_cents": 600,
+            },
+            {
+                "project_id": "b",
+                "responsible_project_id": "b",
+                "share_cents": 400,
+            },
         ]
 
         # The standalone simulated bank was actually called.

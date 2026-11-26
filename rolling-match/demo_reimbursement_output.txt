@@ -68,7 +68,7 @@ kernel         400   400          0         0          0    0
 translation      300     0          0       250         50    0
 website          0     0          0         0          0    0
 
-17. INV-1001 state=paid; allocations on PAY-1-2: [{'project_id': 'docs', 'share_cents': 300}, {'project_id': 'kernel', 'share_cents': 200}]
+17. INV-1001 state=paid; allocations on PAY-1-2: [{'project_id': 'docs', 'responsible_project_id': 'docs', 'share_cents': 300}, {'project_id': 'kernel', 'responsible_project_id': 'kernel', 'share_cents': 200}]
 18. A late contradictory result is rejected (409 payment_result_conflict); the confirmed payment stays.
 
 PASS: joint reimbursement demo completed. Inspect /workspace/rolling-match/demo_reimbursement.db and /workspace/rolling-match/demo_reimbursement.db.bank.db with sqlite3 if desired.

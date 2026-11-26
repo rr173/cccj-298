@@ -102,3 +102,9 @@ class ClosingSign(BaseModel):
 
 class ClosingDiscard(BaseModel):
     source_event_id: NonEmptyId
+
+
+class ProjectMergerCreate(BaseModel):
+    source_event_id: NonEmptyId
+    source_project_id: NonEmptyId
+    successor_project_id: NonEmptyId
