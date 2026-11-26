@@ -13,6 +13,10 @@
 - 捐款、退款、兑现均按 `source_event_id` 做同参幂等重试、改参冲突拒绝；
 - SQLite `BEGIN IMMEDIATE` 写事务保证并发下不会出现半笔拨款或额度透支。
 
+在此基础上还实现了**联合报销**：同一期活动的多个项目用各自已经兑现的配捐，
+共同承担一家供应商的一张发票，财务一次性付清整张发票；付款经过一个独立、
+可本地运行、可重放的模拟银行通道，不接真实银行。详见第 8 节。
+
 ## 1. 运行
 
 ```bash
@@ -53,6 +57,8 @@ python scripts/demo_ledger.py
 7. 同参重试返回原结果并带 `Idempotency-Replayed: true`；同号改参返回
    `409 idempotency_parameter_mismatch`。
 
+联合报销的示例另行保存在第 8.7 节。
+
 ## 3. 测试
 
 ```bash
@@ -61,7 +67,9 @@ pytest
 
 测试覆盖分配顺序、捐赠人额度、部分/多次/超额退款、逐单冲正、项目单独兑现、
 幂等重试/改参拒绝，以及 16–20 线程下的同号兑现、并发兑现、并发退款和捐赠人
-额度竞争。
+额度竞争。联合报销另覆盖份额登记与改参冲突、分别同意/撤回、排队跳过、在途占用、
+缺口、失败重排队、响应丢失/重启恢复、重复与矛盾回执，以及并发送付/退款/确认结果
+不会只扣一部分项目。
 
 ## 4. 主要接口
 
@@ -79,6 +87,21 @@ pytest
 | `GET` | `/campaigns/{cid}/projects/{pid}/grants` | **该项目每次实际拨款及原单明细** |
 | `GET` | `/campaigns/{cid}/donations/{don_source}/reversals` | **某张原单的实际冲正记录** |
 | `GET` | `/campaigns/{cid}/reversals` | 全活动所有原单冲正 |
+| `POST` | `/campaigns/{cid}/invoices` | **登记联合报销发票**（收款方、发票号、各项目份额） |
+| `GET` | `/campaigns/{cid}/invoices` | 发票列表及当前可付款/排队状态、项目额度 |
+| `GET` | `/campaigns/{cid}/invoices/{iid}` | 单张发票详情 |
+| `POST` | `/campaigns/{cid}/invoices/{iid}/consents` | 某项目同意/撤回承担份额 |
+| `POST` | `/campaigns/{cid}/invoices/{iid}/payments` | 财务送付整张发票（仅可付款时） |
+| `GET` | `/campaigns/{cid}/invoices/{iid}/payments` | 该发票的付款指令及确认结果 |
+| `GET` | `/campaigns/{cid}/payments` | 全活动付款指令 |
+| `GET` | `/campaigns/{cid}/payments/{num}` | 单笔付款指令及银行状态 |
+| `POST` | `/campaigns/{cid}/payments/{num}/results` | 送达银行终态结果（成功/失败） |
+| `POST` | `/campaigns/{cid}/payments/{num}/sync` | 重启后按指令号查回/补交并同步结果 |
+| `GET` | `/campaigns/{cid}/reimbursement-funds` | **各项目已付、在途、暂占、可用与缺口** |
+| `POST` | `/simulated-bank/payments` | 模拟通道受理（独立库，按指令号去重） |
+| `GET` | `/simulated-bank/payments/{num}` | 查询模拟通道受理/结果 |
+| `POST` | `/simulated-bank/payments/{num}/results` | 模拟通道确认成功/失败 |
+| `POST` | `/simulated-bank/lose-next-response` | 模拟"受理成功但响应丢失" |
 
 ### 捐款
 
@@ -179,10 +202,136 @@ reversal_amount = net_granted_before - remaining_donation_after_refund
 ## 7. 代码地图
 
 ```text
-app/db.py          SQLite schema、连接、BEGIN IMMEDIATE 写事务
-app/service.py     暂配算法、退款冲正、兑现、幂等和不变量
-app/models.py      请求模型与金额校验
-app/main.py        FastAPI 路由和错误响应
-scripts/demo_ledger.py
-tests/             领域、HTTP、并发测试
+app/db.py              SQLite schema、连接、BEGIN IMMEDIATE 写事务
+app/service.py         暂配算法、退款冲正、兑现、幂等和不变量
+app/reimbursement.py   联合报销：份额、同意、排队、送付、银行结果、项目额度/缺口
+app/bank.py            独立持久化的模拟付款通道（按指令号去重、终态不可覆盖）
+app/models.py          请求模型与金额校验
+app/main.py            FastAPI 路由和错误响应
+scripts/demo_ledger.py         原有配捐小账
+scripts/demo_reimbursement.py  联合报销可复跑示例
+tests/                 领域、HTTP、并发、模拟通道测试
 ```
+
+## 8. 联合报销
+
+### 8.1 资金口径
+
+每个项目的可报销额度只来自**已兑现的实际配捐**：
+
+```text
+realized_net_grant = 该项目所有 grant_items − 该项目所有 reversals
+available          = realized_net_grant − paid − in_flight − reserved
+gap                = max(0, paid + in_flight − realized_net_grant)
+```
+
+- 暂配（provisional）不参与报销，任何项目都不能借别的项目的钱；
+- 已付（paid）与在途（in_flight）先扣；
+- `reserved` 是当前排队中被整张发票暂占的份额；
+- 若已付+在途超过净拨款，就显示 `gap_cents`，后续拨款先补缺口，剩余才成为可用额度。
+
+### 8.2 登记发票
+
+```bash
+curl -sS -X POST http://127.0.0.1:8000/api/v1/campaigns/oss-2026/invoices \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "source_event_id": "invoice-0001",
+    "payee": "Print Shop Ltd",
+    "vendor_invoice_number": "INV-1001",
+    "shares": [
+      {"project_id": "docs",        "share_cents": 300},
+      {"project_id": "kernel",      "share_cents": 200}
+    ]
+  }'
+```
+
+- 发票总额由各项目正整数分份额相加得到，不单独传；
+- 同一活动 + 收款方 + 供应商发票号只能有一张：同参重试取回原单
+  （`Idempotency-Replayed: true`）；改份额重试返回
+  `409 invoice_registration_conflict`，不能借重试改份额；
+- 每个项目在发票中最多出现一次。
+
+### 8.3 分别同意 / 撤回
+
+```bash
+curl -sS -X POST \
+  http://127.0.0.1:8000/api/v1/campaigns/oss-2026/invoices/1/consents \
+  -H 'Content-Type: application/json' \
+  -d '{"source_event_id":"consent-docs-1","project_id":"docs","consented":true}'
+```
+
+- 各分摊项目分别同意；只有**全部同意**的发票才参与排队；
+- 发票没有在途（pending）或已成功（succeeded）的付款时可以撤回同意；
+  有在途/已成功付款时返回 `409 invoice_consent_locked`。
+
+### 8.4 排队与可付款状态
+
+- 按发票登记顺序处理已全部同意的未付发票；
+- 一张发票只有**每个项目都能各自承担自己的份额**时才整张暂占；放不下就整张跳过，
+  不影响后面的发票；
+- 无法付款的发票在 `not_payable_reason` 中说明原因：
+  `consent_pending` / `insufficient_project_funds` / `payment_in_flight` /
+  `invoice_already_paid`；资金不足时 `shortfall_cents_by_project` 给出每个项目的缺口；
+- 项目新增拨款、收到冲正、同意或撤回后，未送付发票的可付款状态按当前资金与同意情况实时重算。
+
+### 8.5 送付、在途与结果
+
+```bash
+# 财务只能送付当时可付款的整张发票
+curl -sS -X POST \
+  http://127.0.0.1:8000/api/v1/campaigns/oss-2026/invoices/1/payments \
+  -H 'Content-Type: application/json' \
+  -d '{"source_event_id":"pay-invoice-1"}'
+# -> {"instruction_number":"PAY-1-1", ...,"status":"pending"}
+```
+
+- 受理送付即从各项目份额中保留该笔付款，直到银行给出明确结果；
+- 期间即使发生冲正，也不挪用这笔占用、不改动付款指令；只是项目的
+  `gap_cents` 会显示缺口，后续拨款先补缺口；
+- 明确成功：写入 `succeeded`，保留每个项目实际承担的份额明细（`allocations`）；
+- 明确失败：释放占用，发票凭仍然有效的同意重新排队，由财务决定是否再发一笔；
+- **没有明确结果不算失败**，指令保持 `pending`；
+- 同一发票同时最多一笔在途、最多一笔成功（数据库部分唯一索引兜底）。
+
+送达银行结果（也可由模拟通道驱动）：
+
+```bash
+curl -sS -X POST \
+  http://127.0.0.1:8000/api/v1/campaigns/oss-2026/payments/PAY-1-1/results \
+  -H 'Content-Type: application/json' \
+  -d '{"outcome":"succeeded","result_event_id":"bank-evt-1"}'
+```
+
+重复送达同一结果无副作用并带 `Idempotency-Replayed: true`；互相矛盾的终态
+返回 `409 payment_result_conflict`，已确认结果不被覆盖；旧指令的回执只作用于旧指令，
+不会影响新指令。
+
+### 8.6 模拟付款通道与重启恢复
+
+- 通道是独立 SQLite 库（默认 `<ledger>.bank.db`），不接真实银行；
+- 按**付款指令号**去重：同一指令号重复提交只对应一笔付款；改支付要素复用同一号码会被拒绝；
+- 支持"受理成功但响应丢失"（`POST /api/v1/simulated-bank/lose-next-response`）；
+- 应用重启或送付重试时，`GET /payments/{num}` 能查到同一笔待确认指令，
+  `POST /payments/{num}/sync` 会把银行的明确结果同步回账本；若进程恰好在提交银行前崩溃，
+  sync 会以**同一个指令号**补交，绝不生成第二笔付款；
+- 重试旧的送付请求（同 `source_event_id`）返回原指令，不会变成一次新付款。
+
+### 8.7 可复跑示例
+
+```bash
+python scripts/demo_reimbursement.py
+```
+
+每次重建 `demo_reimbursement.db` 与独立的 `demo_reimbursement.db.bank.db`，
+只用系统 Python + SQLite。完整稳定输出保存在
+[`demo_reimbursement_output.txt`](./demo_reimbursement_output.txt)，依次演示：
+实际配捐额度、发票登记与幂等/改参冲突、分别同意、按登记顺序整张跳过、
+送付在途占用、在途冲正产生缺口、响应丢失与重启恢复、失败释放重排队、二次成功保留分摊明细。
+
+### 8.8 并发保证
+
+所有报销写操作（登记、同意、送付、确认结果）都在记账库的
+`BEGIN IMMEDIATE` 事务里串行化；付款指令的状态变更一次作用于整张发票的所有份额，
+因此并发退款、同意变更、送付或确认结果时，不会留下"只扣一部分项目"的账。
+模拟通道另有独立事务和自己的约束，保证结果重复送达、旧回执、矛盾终态都不会破坏已确认结果。

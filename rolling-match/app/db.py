@@ -144,6 +144,100 @@ CREATE TABLE IF NOT EXISTS idempotency_records (
         DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     PRIMARY KEY (campaign_id, operation, source_event_id)
 );
+
+-- ------------------------------------------------------------------
+-- Joint reimbursement of one vendor invoice by several projects.
+-- Shares are the only source of the invoice total and are immutable
+-- after registration.
+-- ------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS invoices (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    campaign_id TEXT NOT NULL REFERENCES campaigns(id),
+    payee TEXT NOT NULL,
+    vendor_invoice_number TEXT NOT NULL,
+    total_amount_cents INTEGER NOT NULL CHECK (total_amount_cents > 0),
+    registration_hash TEXT NOT NULL,
+    source_event_id TEXT NOT NULL,
+    created_at TEXT NOT NULL
+        DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE (campaign_id, payee, vendor_invoice_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_invoices_campaign_order
+    ON invoices(campaign_id, id);
+CREATE INDEX IF NOT EXISTS idx_invoices_vendor_number
+    ON invoices(campaign_id, vendor_invoice_number);
+
+CREATE TABLE IF NOT EXISTS invoice_shares (
+    invoice_id INTEGER NOT NULL REFERENCES invoices(id),
+    campaign_id TEXT NOT NULL REFERENCES campaigns(id),
+    project_id TEXT NOT NULL,
+    share_cents INTEGER NOT NULL CHECK (share_cents > 0),
+    created_at TEXT NOT NULL
+        DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (invoice_id, project_id),
+    FOREIGN KEY (campaign_id, project_id)
+        REFERENCES projects(campaign_id, id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_invoice_shares_project
+    ON invoice_shares(campaign_id, project_id);
+
+-- Each allocating project consents separately.  A missing row means "not yet
+-- consented"; rows are only updated through an idempotent source event.
+CREATE TABLE IF NOT EXISTS invoice_consents (
+    invoice_id INTEGER NOT NULL REFERENCES invoices(id),
+    campaign_id TEXT NOT NULL REFERENCES campaigns(id),
+    project_id TEXT NOT NULL,
+    consented INTEGER NOT NULL DEFAULT 0 CHECK (consented IN (0, 1)),
+    last_source_event_id TEXT,
+    updated_at TEXT NOT NULL
+        DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (invoice_id, project_id),
+    FOREIGN KEY (campaign_id, project_id)
+        REFERENCES projects(campaign_id, id)
+);
+
+-- One row per submission attempt.  The bank de-duplicates by the immutable
+-- instruction_number; an invoice can have many failed attempts but never more
+-- than one pending or one succeeded instruction at a time.
+CREATE TABLE IF NOT EXISTS payment_instructions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    campaign_id TEXT NOT NULL REFERENCES campaigns(id),
+    invoice_id INTEGER NOT NULL REFERENCES invoices(id),
+    instruction_number TEXT NOT NULL UNIQUE,
+    attempt_no INTEGER NOT NULL CHECK (attempt_no > 0),
+    payee TEXT NOT NULL,
+    vendor_invoice_number TEXT NOT NULL,
+    amount_cents INTEGER NOT NULL CHECK (amount_cents > 0),
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'succeeded', 'failed')),
+    request_source_event_id TEXT NOT NULL,
+    result_event_id TEXT,
+    result_at TEXT,
+    created_at TEXT NOT NULL
+        DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at TEXT NOT NULL
+        DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE (invoice_id, attempt_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_payment_instructions_invoice
+    ON payment_instructions(invoice_id, id);
+CREATE INDEX IF NOT EXISTS idx_payment_instructions_campaign
+    ON payment_instructions(campaign_id, id);
+CREATE INDEX IF NOT EXISTS idx_payment_instructions_status
+    ON payment_instructions(campaign_id, status);
+
+-- Structural guarantees: at most one in-flight and one successful payment per
+-- invoice.  Failed attempts are historical and may accumulate.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_one_pending
+    ON payment_instructions(invoice_id)
+    WHERE status = 'pending';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_one_succeeded
+    ON payment_instructions(invoice_id)
+    WHERE status = 'succeeded';
 """
 
 

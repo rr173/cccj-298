@@ -1,0 +1,75 @@
+
+== 1. Realized actual grants become reimbursement capacity ==
+project   realized  paid  in-flight  reserved  available  gap
+docs           500     0          0         0        500    0
+kernel         400     0          0         0        400    0
+translation      300     0          0         0        300    0
+website          0     0          0         0          0    0
+
+2. Registered INV-1001: total is the sum of shares = 500¢, state=unpaid, payable=False
+3. Exact retry of reg-1 returns the ORIGINAL invoice #1 (replayed=true), not a second one.
+4. Re-registering the same campaign+payee+number with different shares is rejected with 409; shares cannot be edited by retry.
+
+5. Only docs has consented; INV-1001 is still not payable (missing=['kernel']).
+
+== 6. Fully consented INV-1001 temporarily reserves both shares ==
+project   realized  paid  in-flight  reserved  available  gap
+docs           500     0          0       300        200    0
+kernel         400     0          0       200        200    0
+translation      300     0          0         0        300    0
+website          0     0          0         0          0    0
+
+== 7. INV-1002 needs 250¢ but docs only has 200¢ left, so it is skipped whole; INV-1003 still reserves translation ==
+order vendor_invoice payable state    reason        shortfall
+    1 INV-1001       True    unpaid   None          None
+    2 INV-1002       False   unpaid   insufficient_project_funds {'docs': 50}
+    3 INV-1003       True    unpaid   None          None
+
+8. Finance submits INV-1001 as one instruction PAY-1-1 for 500¢.
+
+== 9. Both project shares are now held in flight ==
+project   realized  paid  in-flight  reserved  available  gap
+docs           500     0        300         0        200    0
+kernel         400     0        200         0        200    0
+translation      300     0          0       250         50    0
+website          0     0          0         0          0    0
+
+== 10. Refund reverses 250¢ of docs realized money; the in-flight hold stays at 300¢ and docs shows a 50¢ gap ==
+project   realized  paid  in-flight  reserved  available  gap
+docs           250     0        300         0          0   50
+kernel         400     0        200         0        200    0
+translation      300     0          0       250         50    0
+website          0     0          0         0          0    0
+   The instruction amount and the 300¢ hold were not changed by the refund; the shortfall is shown against docs.
+
+== 10b. A new 100¢ actual grant first fills the 50¢ gap; the other 50¢ becomes available headroom ==
+project   realized  paid  in-flight  reserved  available  gap
+docs           350     0        300         0         50    0
+kernel         400     0        200         0        200    0
+translation      300     0          0       250         50    0
+website          0     0          0         0          0    0
+
+11. Simulated bank accepts INV-1004 as PAY-4-1 but the response is lost. The ledger instruction stays pending and is recoverable.
+12. After an app restart the same instruction is recovered, and the old submit retry returns that instruction instead of paying again.
+13. The bank later confirms success; sync pulls the explicit result into the ledger without re-submitting anything.
+
+== 14. INV-1001 payment failed: its holds are released ==
+project   realized  paid  in-flight  reserved  available  gap
+docs           350     0          0       300         50    0
+kernel         400   200          0       200          0    0
+translation      300     0          0       250         50    0
+website          0     0          0         0          0    0
+15. INV-1001 requeues with its still-valid consents: payable=True, attempt count=1.
+
+== 16. Second attempt succeeded; paid amounts are kept per project ==
+project   realized  paid  in-flight  reserved  available  gap
+docs           350   300          0         0         50    0
+kernel         400   400          0         0          0    0
+translation      300     0          0       250         50    0
+website          0     0          0         0          0    0
+
+17. INV-1001 state=paid; allocations on PAY-1-2: [{'project_id': 'docs', 'share_cents': 300}, {'project_id': 'kernel', 'share_cents': 200}]
+18. A late contradictory result is rejected (409 payment_result_conflict); the confirmed payment stays.
+
+PASS: joint reimbursement demo completed. Inspect /workspace/rolling-match/demo_reimbursement.db and /workspace/rolling-match/demo_reimbursement.db.bank.db with sqlite3 if desired.
+

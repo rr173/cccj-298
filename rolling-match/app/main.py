@@ -10,37 +10,77 @@ from fastapi.responses import JSONResponse
 
 from .db import init_db, resolve_db_path
 from .models import (
+    BankLoseResponseSimulation,
+    BankResultSimulation,
+    BankSubmitSimulation,
     CampaignCreate,
     DonationCreate,
+    InvoiceConsentCreate,
+    InvoiceRegister,
+    PaymentResult,
+    PaymentSubmit,
     ProjectCreate,
     ProjectReadyUpdate,
     RefundCreate,
     SettlementCreate,
 )
+from .bank import BankError, resolve_bank_db_path, SimulatedBank
+from .reimbursement import ReimbursementService
 from .service import LedgerError, LedgerService
 
 
-def create_app(db_path: str | Path | None = None) -> FastAPI:
+def create_app(
+    db_path: str | Path | None = None,
+    bank_db_path: str | Path | None = None,
+) -> FastAPI:
     path = resolve_db_path(db_path)
     init_db(path)
+    bank_path = (
+        str(bank_db_path)
+        if bank_db_path is not None
+        else resolve_bank_db_path(path)
+    )
+    SimulatedBank(bank_path)  # create the standalone bank database/schema
 
     app = FastAPI(
         title="Open Source Foundation Rolling Match API",
-        version="1.0.0",
+        version="1.1.0",
         description=(
             "Integer-cent donation matching with provisional allocation, "
             "project-level realization, immutable grant history, idempotent "
-            "events, and order-level refund corrections."
+            "events, order-level refund corrections, and joint vendor-invoice "
+            "reimbursement through a standalone simulated payment channel."
         ),
     )
     app.state.db_path = path
+    app.state.bank_db_path = bank_path
 
     def service() -> LedgerService:
         return LedgerService(app.state.db_path)
 
+    def reimbursement() -> ReimbursementService:
+        return ReimbursementService(
+            app.state.db_path, app.state.bank_db_path
+        )
+
     @app.exception_handler(LedgerError)
     async def ledger_error_handler(
         _request: Request, exc: LedgerError
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={
+                "error": {
+                    "code": exc.code,
+                    "message": exc.message,
+                    "details": exc.details,
+                }
+            },
+        )
+
+    @app.exception_handler(BankError)
+    async def bank_error_handler(
+        _request: Request, exc: BankError
     ) -> JSONResponse:
         return JSONResponse(
             status_code=exc.status_code,
@@ -197,6 +237,173 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         return service().list_reversals(
             campaign_id, donation_source_event_id
         )
+
+    # ------------------------------------------------------------------
+    # Joint vendor-invoice reimbursement
+    # ------------------------------------------------------------------
+    @app.post(
+        "/api/v1/campaigns/{campaign_id}/invoices",
+        tags=["reimbursements"],
+        status_code=201,
+    )
+    def register_invoice(
+        campaign_id: str, payload: InvoiceRegister
+    ) -> JSONResponse:
+        result = reimbursement().register_invoice(
+            campaign_id,
+            source_event_id=payload.source_event_id,
+            payee=payload.payee,
+            vendor_invoice_number=payload.vendor_invoice_number,
+            shares=[s.model_dump() for s in payload.shares],
+        )
+        return _command_response(result)
+
+    @app.get(
+        "/api/v1/campaigns/{campaign_id}/invoices",
+        tags=["reimbursements"],
+    )
+    def list_invoices(campaign_id: str) -> dict[str, Any]:
+        return reimbursement().invoice_overview(campaign_id)
+
+    @app.get(
+        "/api/v1/campaigns/{campaign_id}/invoices/{invoice_id}",
+        tags=["reimbursements"],
+    )
+    def get_invoice(campaign_id: str, invoice_id: int) -> dict[str, Any]:
+        return reimbursement().get_invoice(campaign_id, invoice_id)
+
+    @app.post(
+        "/api/v1/campaigns/{campaign_id}/invoices/{invoice_id}/consents",
+        tags=["reimbursements"],
+    )
+    def set_invoice_consent(
+        campaign_id: str, invoice_id: int, payload: InvoiceConsentCreate
+    ) -> JSONResponse:
+        result = reimbursement().set_invoice_consent(
+            campaign_id,
+            invoice_id,
+            source_event_id=payload.source_event_id,
+            project_id=payload.project_id,
+            consented=payload.consented,
+        )
+        return _command_response(result)
+
+    @app.post(
+        "/api/v1/campaigns/{campaign_id}/invoices/{invoice_id}/payments",
+        tags=["reimbursements"],
+        status_code=201,
+    )
+    def submit_invoice_payment(
+        campaign_id: str, invoice_id: int, payload: PaymentSubmit
+    ) -> JSONResponse:
+        result = reimbursement().submit_payment(
+            campaign_id, invoice_id, source_event_id=payload.source_event_id
+        )
+        return _command_response(result)
+
+    @app.get(
+        "/api/v1/campaigns/{campaign_id}/invoices/{invoice_id}/payments",
+        tags=["reimbursements"],
+    )
+    def list_invoice_payments(
+        campaign_id: str, invoice_id: int
+    ) -> dict[str, Any]:
+        return reimbursement().list_invoice_payments(campaign_id, invoice_id)
+
+    @app.get(
+        "/api/v1/campaigns/{campaign_id}/payments",
+        tags=["reimbursements"],
+    )
+    def list_payment_instructions(campaign_id: str) -> dict[str, Any]:
+        return reimbursement().list_payment_instructions(campaign_id)
+
+    @app.get(
+        "/api/v1/campaigns/{campaign_id}/payments/{instruction_number}",
+        tags=["reimbursements"],
+    )
+    def get_payment_instruction(
+        campaign_id: str, instruction_number: str
+    ) -> dict[str, Any]:
+        return reimbursement().get_payment_instruction(
+            campaign_id, instruction_number
+        )
+
+    @app.post(
+        "/api/v1/campaigns/{campaign_id}/payments/{instruction_number}/results",
+        tags=["reimbursements"],
+    )
+    def deliver_payment_result(
+        campaign_id: str,
+        instruction_number: str,
+        payload: PaymentResult,
+    ) -> JSONResponse:
+        result = reimbursement().deliver_payment_result(
+            campaign_id,
+            instruction_number,
+            outcome=payload.outcome,
+            result_event_id=payload.result_event_id,
+        )
+        return _command_response(result)
+
+    @app.post(
+        "/api/v1/campaigns/{campaign_id}/payments/{instruction_number}/sync",
+        tags=["reimbursements"],
+    )
+    def sync_payment_result(
+        campaign_id: str, instruction_number: str
+    ) -> dict[str, Any]:
+        return reimbursement().sync_payment_result(
+            campaign_id, instruction_number
+        )
+
+    @app.get(
+        "/api/v1/campaigns/{campaign_id}/reimbursement-funds",
+        tags=["reimbursements"],
+    )
+    def get_reimbursement_funds(campaign_id: str) -> dict[str, Any]:
+        return reimbursement().project_funds(campaign_id)
+
+    # ------------------------------------------------------------------
+    # Simulated bank channel (local only; no real bank is contacted)
+    # ------------------------------------------------------------------
+    @app.post("/api/v1/simulated-bank/payments", tags=["simulated-bank"])
+    def simulated_bank_submit(
+        payload: BankSubmitSimulation,
+    ) -> dict[str, Any]:
+        return reimbursement().bank.submit(**payload.model_dump())
+
+    @app.get(
+        "/api/v1/simulated-bank/payments/{instruction_number}",
+        tags=["simulated-bank"],
+    )
+    def simulated_bank_get(instruction_number: str) -> dict[str, Any]:
+        return {
+            "payment": reimbursement().bank.get(instruction_number),
+            "events": reimbursement().bank.list_events(instruction_number),
+        }
+
+    @app.post(
+        "/api/v1/simulated-bank/payments/{instruction_number}/results",
+        tags=["simulated-bank"],
+    )
+    def simulated_bank_result(
+        instruction_number: str, payload: BankResultSimulation
+    ) -> dict[str, Any]:
+        return reimbursement().bank.confirm(
+            instruction_number,
+            outcome=payload.outcome,
+            result_event_id=payload.result_event_id,
+        )
+
+    @app.post(
+        "/api/v1/simulated-bank/lose-next-response",
+        tags=["simulated-bank"],
+    )
+    def simulated_bank_lose_response(
+        payload: BankLoseResponseSimulation,
+    ) -> dict[str, Any]:
+        reimbursement().bank.set_lose_next_submit_response(payload.enabled)
+        return {"lose_next_submit_response": payload.enabled}
 
     return app
 

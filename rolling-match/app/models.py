@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field
 
@@ -46,3 +46,46 @@ class RefundCreate(BaseModel):
 
 class SettlementCreate(BaseModel):
     source_event_id: NonEmptyId
+
+
+class InvoiceShareCreate(BaseModel):
+    project_id: NonEmptyId
+    share_cents: CentsPositive
+
+
+class InvoiceRegister(BaseModel):
+    source_event_id: NonEmptyId
+    payee: NonEmptyName
+    vendor_invoice_number: NonEmptyId
+    shares: list[InvoiceShareCreate] = Field(min_length=1)
+
+
+class InvoiceConsentCreate(BaseModel):
+    source_event_id: NonEmptyId
+    project_id: NonEmptyId
+    consented: bool
+
+
+class PaymentSubmit(BaseModel):
+    source_event_id: NonEmptyId
+
+
+class PaymentResult(BaseModel):
+    outcome: Literal["succeeded", "failed"]
+    result_event_id: NonEmptyId
+
+
+class BankSubmitSimulation(BaseModel):
+    instruction_number: NonEmptyId
+    payee: NonEmptyName
+    vendor_invoice_number: NonEmptyId
+    amount_cents: CentsPositive
+
+
+class BankResultSimulation(BaseModel):
+    outcome: Literal["succeeded", "failed"]
+    result_event_id: NonEmptyId
+
+
+class BankLoseResponseSimulation(BaseModel):
+    enabled: bool = True
